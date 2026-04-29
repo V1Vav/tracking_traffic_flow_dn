@@ -1,0 +1,19 @@
+# Ignore dataset and generated output files
+Dataset/
+data_dn/
+ouput_video/
+temp/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment folders
+venv/
+.env/
+.env.*
+
+# IDE/editor files
+.vscode/
+.idea/
