@@ -10,9 +10,19 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 # ===== Argument =====
 parser = argparse.ArgumentParser()
 parser.add_argument("--video", type=str, required=True)
-parser.add_argument("--model", type=str, default="yolov8s.pt")  
+parser.add_argument("--model", type=str, default="yolov8s.pt")
 parser.add_argument("--output", type=str, default=None)
 parser.add_argument("--csv", type=str, default=None)
+parser.add_argument("--imgsz", type=int, default=1280,
+                    help="YOLO inference image size for better distant detection")
+parser.add_argument("--conf", type=float, default=0.15,
+                    help="YOLO confidence threshold")
+parser.add_argument("--iou", type=float, default=0.45,
+                    help="YOLO IOU threshold")
+parser.add_argument("--detect-interval", type=int, default=1,
+                    help="Detect every N frames")
+parser.add_argument("--min-conf", type=float, default=0.18,
+                    help="Minimum confidence for car/bus/truck")
 args = parser.parse_args()
 
 # ===== Load model =====
@@ -21,8 +31,8 @@ model.to("cuda")
 
 # ===== Tracker =====
 tracker = DeepSort(
-    max_age=30,
-    n_init=3,
+    max_age=60,
+    n_init=5,
     max_cosine_distance=0.2,
     nn_budget=100
 )
@@ -67,7 +77,7 @@ if args.csv is not None:
 
 prev_time = 0
 frame_id = 0
-detect_interval = 2
+detect_interval = args.detect_interval
 detections = []
 
 names = model.names  # class names
@@ -79,18 +89,19 @@ while cap.isOpened():
         break
 
     frame_id += 1
+    loop_start = time.time()
+    detections = []
 
     # ===== YOLO detect =====
     if frame_id % detect_interval == 0:
         results = model(
             frame,
-            imgsz=960,   
-            conf=0.15,    
-            iou=0.5,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            iou=args.iou,
+            classes=[2, 3, 5, 7],
             verbose=False
         )
-
-        detections = []
 
         for r in results:
             for box in r.boxes:
@@ -106,7 +117,7 @@ while cap.isOpened():
                     if conf < 0.1:
                         continue
                 else:
-                    if conf < 0.3:
+                    if conf < args.min_conf:
                         continue
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -121,7 +132,7 @@ while cap.isOpened():
         if not track.is_confirmed():
             continue
 
-        if track.time_since_update > 1:
+        if track.time_since_update > 5:
             continue
 
         track_id = track.track_id
@@ -198,7 +209,12 @@ while cap.isOpened():
         out.write(frame)
     cv2.imshow("YOLOv8 + DeepSORT (Traffic)", frame)
 
-    delay_ms = max(1, int(round(1000.0 / fps_input)))
+    if fps_input > 0:
+        loop_elapsed = (time.time() - loop_start) * 1000.0
+        delay_ms = int(round(max(1.0, 1000.0 / fps_input - loop_elapsed)))
+    else:
+        delay_ms = 1
+
     if cv2.waitKey(delay_ms) & 0xFF == ord('q'):
         break
     
