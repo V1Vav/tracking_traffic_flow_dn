@@ -1,6 +1,7 @@
 import threading
 import time
 from collections import Counter, deque
+from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -233,33 +234,48 @@ class FlowApp:
 
             fps_input = cap.get(cv2.CAP_PROP_FPS) or 30.0
             frame_duration = 1.0 / fps_input
-            frames = []
+            buffer_size = max(8, int(fps_input * 5))
+            frame_queue = Queue(maxsize=buffer_size)
+            reader_done = threading.Event()
+
+            def video_reader():
+                try:
+                    while cap.isOpened() and not self.stop_event.is_set():
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        frame_queue.put(frame)
+                finally:
+                    reader_done.set()
+                    cap.release()
 
             with self.state_lock:
-                self.worker_state["status"] = "Loading video into memory..."
+                self.worker_state["status"] = "Buffering video..."
 
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                frames.append(frame)
-            cap.release()
+            reader_thread = threading.Thread(target=video_reader, daemon=True)
+            reader_thread.start()
 
-            if not frames:
-                raise RuntimeError("Video không có frame nào")
+            while frame_queue.qsize() < min(buffer_size, 4) and not reader_done.is_set() and not self.stop_event.is_set():
+                time.sleep(0.05)
 
             with self.state_lock:
-                self.worker_state["status"] = f"Loaded {len(frames)} frames @ {fps_input:.1f} FPS"
+                self.worker_state["status"] = f"Buffer ready @ {fps_input:.1f} FPS"
 
             flow_events = deque()
             track_meta = {}
             prev_time = time.time()
             playback_start = time.time()
+            frame_id = 0
 
-            for frame_id, frame in enumerate(frames, start=1):
-                if self.stop_event.is_set():
-                    break
+            while not self.stop_event.is_set():
+                try:
+                    frame = frame_queue.get(timeout=0.1)
+                except Empty:
+                    if reader_done.is_set() and frame_queue.empty():
+                        break
+                    continue
 
+                frame_id += 1
                 current_time = frame_id / fps_input
                 new_events = []
                 detections = []
@@ -388,7 +404,11 @@ class FlowApp:
             with self.state_lock:
                 self.worker_state["status"] = f"Error: {exc}"
         finally:
-            pass
+            if "reader_thread" in locals() and reader_thread is not None:
+                try:
+                    reader_thread.join(timeout=1.0)
+                except Exception:
+                    pass
 
     def _update_ui(self):
         with self.state_lock:
