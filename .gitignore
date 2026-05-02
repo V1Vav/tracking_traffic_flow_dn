@@ -17,3 +17,7 @@ venv/
 # IDE/editor files
 .vscode/
 .idea/
+
+# cache and log files
+*.log
+*.cache
