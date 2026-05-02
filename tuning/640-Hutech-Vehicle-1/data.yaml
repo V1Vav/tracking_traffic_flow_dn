@@ -1,0 +1,19 @@
+names:
+- xe buyt
+- xe container
+- xe cuu hoa
+- xe dap
+- xe hoi
+- xe may
+- xe tai
+- xe van
+nc: 8
+roboflow:
+  license: CC BY 4.0
+  project: 640-hutech-vehicle-nq2ts
+  url: https://universe.roboflow.com/ngohoangphuc/640-hutech-vehicle-nq2ts/dataset/1
+  version: 1
+  workspace: ngohoangphuc
+test: ../test/images
+train: ../train/images
+val: ../valid/images
