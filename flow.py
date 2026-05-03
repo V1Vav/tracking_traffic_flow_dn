@@ -30,7 +30,8 @@ CLASS_NAMES = {
     4: "truck"
 }
 
-VALID_BRANCHES = {"top", "left", "right"}  # ignore one obscured branch (bottom)
+VALID_BRANCHES = {"top", "bottom", "left", "right"} 
+
 COLOR_NAME_TO_BGR = {
     "yellow": (0, 255, 255),
     "red": (0, 0, 255),
@@ -206,9 +207,10 @@ def draw_region_overlay(frame, margin_fraction, template=None):
                 text_scale, text_color, text_thickness)
 
 
-def format_flow_metrics(event_window, window_seconds):
-    count = len(event_window)
-    weighted_sum = sum(event["weight"] for event in event_window)
+def format_flow_metrics(event_window, window_seconds, active_track_ids):
+    filtered_events = [event for event in event_window if event["track_id"] in active_track_ids]
+    count = len(filtered_events)
+    weighted_sum = sum(event["weight"] for event in filtered_events)
     if window_seconds <= 0:
         return 0.0, 0.0
     flow_pce_pm = weighted_sum * 60.0 / window_seconds
@@ -236,6 +238,7 @@ class FlowApp:
         self.available_models = ["models/yolov8n.pt", "models/yolov8s.pt", "models/yolov8m.pt", "models/yolov8l.pt", "models/yolov8x.pt", "models/tuning.pt"]
 
         self.region_template = None
+        self.display_template_var = tk.BooleanVar(value=False)
 
         self.metrics = {
             "frame": tk.StringVar(value="0"),
@@ -255,6 +258,10 @@ class FlowApp:
             "right_out": tk.StringVar(value="0.0"),
             "right_in_count": tk.StringVar(value="0"),
             "right_out_count": tk.StringVar(value="0"),
+            "bottom_in": tk.StringVar(value="0.0"),
+            "bottom_out": tk.StringVar(value="0.0"),
+            "bottom_in_count": tk.StringVar(value="0"),
+            "bottom_out_count": tk.StringVar(value="0"),
         }
 
         self.worker_state = {
@@ -276,6 +283,10 @@ class FlowApp:
             "right_out": "0.0",
             "right_in_count": "0",
             "right_out_count": "0",
+            "bottom_in": "0.0",
+            "bottom_out": "0.0",
+            "bottom_in_count": "0",
+            "bottom_out_count": "0",
         }
 
         self.latest_pil_image = None
@@ -335,10 +346,13 @@ class FlowApp:
         mapping_entry.grid(row=7, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(control_frame, text="Browse...", command=self.browse_template_mapping).grid(row=7, column=1, sticky="ew")
 
+        ttk.Checkbutton(control_frame, text="Display Region Template",
+                            variable=self.display_template_var).grid(row=8, column=0, columnspan=2, sticky="ew", pady=4)
+
         self.start_button = ttk.Button(control_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=8, column=0, columnspan=2, pady=8, sticky="ew")
+        self.start_button.grid(row=9, column=0, columnspan=2, pady=8, sticky="ew")
         self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.grid(row=9, column=0, columnspan=2, sticky="ew")
+        self.stop_button.grid(row=10, column=0, columnspan=2, sticky="ew")
 
         for child in control_frame.winfo_children():
             child.grid_configure(padx=2, pady=2)
@@ -388,6 +402,12 @@ class FlowApp:
         ttk.Label(branch_frame, textvariable=self.metrics["right_out"], anchor="center").grid(row=3, column=2, sticky="ew", padx=4)
         ttk.Label(branch_frame, textvariable=self.metrics["right_in_count"], anchor="center").grid(row=3, column=3, sticky="ew", padx=4)
         ttk.Label(branch_frame, textvariable=self.metrics["right_out_count"], anchor="center").grid(row=3, column=4, sticky="ew", padx=4)
+
+        ttk.Label(branch_frame, text="Bottom").grid(row=4, column=0, sticky="w", padx=4)
+        ttk.Label(branch_frame, textvariable=self.metrics["bottom_in"], anchor="center").grid(row=4, column=1, sticky="ew", padx=4)
+        ttk.Label(branch_frame, textvariable=self.metrics["bottom_out"], anchor="center").grid(row=4, column=2, sticky="ew", padx=4)
+        ttk.Label(branch_frame, textvariable=self.metrics["bottom_in_count"], anchor="center").grid(row=4, column=3, sticky="ew", padx=4)
+        ttk.Label(branch_frame, textvariable=self.metrics["bottom_out_count"], anchor="center").grid(row=4, column=4, sticky="ew", padx=4)
 
         status_frame = ttk.Frame(right_frame)
         status_frame.pack(fill="x")
@@ -536,7 +556,8 @@ class FlowApp:
 
                 frame_id += 1
                 current_time = frame_id / fps_input
-                draw_region_overlay(frame, self.region_margin, self.region_template)
+                if self.display_template_var.get():
+                    draw_region_overlay(frame, self.region_margin, self.region_template)
                 new_events = []
                 detections = []
 
@@ -553,18 +574,24 @@ class FlowApp:
                         for box in r.boxes:
                             cls = int(box.cls[0])
                             conf = float(box.conf[0])
-                            # if cls not in CLASS_WEIGHTS:
-                            #     continue
-                            # if cls == 3 and conf < 0.1:
-                            #     continue
-                            # if cls != 3 and conf < 0.18:
-                            #     continue
+                            if cls not in CLASS_WEIGHTS:
+                                continue
+                            if cls == 2 and conf < 0.3:
+                                continue
+                            if cls != 2 and conf < 0.15:
+                                continue
+                            # 0: 0.2,   # bicycle
+                            # 1: 0.3,   # motorcycle
+                            # 2: 1.0,   # car
+                            # 3: 2.0,   # bus
+                            # 4: 2.0    # truck
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             w, h = x2 - x1, y2 - y1
                             detections.append(([x1, y1, w, h], conf, cls))
 
                 tracks = tracker.update_tracks(detections, frame=frame)
                 active_tracks = 0
+                active_track_ids = set()
 
                 for track in tracks:
                     if not track.is_confirmed() or track.time_since_update > 5:
@@ -572,6 +599,7 @@ class FlowApp:
 
                     active_tracks += 1
                     track_id = track.track_id
+                    active_track_ids.add(track_id)
                     l, t, r, b = map(int, track.to_ltrb())
                     cls = track.det_class
                     centroid = centroid_from_box((l, t, r, b))
@@ -626,8 +654,13 @@ class FlowApp:
                     cv2.putText(frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     cv2.circle(frame, centroid, 3, color, -1)
 
+                curr_time = time.time()
+                fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 0.0
+                prev_time = curr_time
+
+                active_track_ids = {track.track_id for track in tracks if track.is_confirmed() and track.time_since_update <= 5}
                 cleanup_old_events(flow_events, current_time, self.flow_window)
-                flow_pce_pm, flow_veh_pm = format_flow_metrics(flow_events, self.flow_window)
+                flow_pce_pm, flow_veh_pm = format_flow_metrics(flow_events, self.flow_window, active_track_ids)
                 branch_pce = {
                     (branch, direction): 0.0
                     for branch in VALID_BRANCHES
@@ -639,14 +672,14 @@ class FlowApp:
                     for direction in ("in", "out")
                 }
                 for event in flow_events:
+                    if event["track_id"] not in active_track_ids:
+                        continue
                     key = (event["branch"], event["direction"])
                     if key in branch_pce:
                         branch_pce[key] += event["weight"]
                         branch_count[key] += 1
 
                 curr_time = time.time()
-                fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 0.0
-                prev_time = curr_time
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(rgb_frame)
@@ -672,6 +705,10 @@ class FlowApp:
                     self.worker_state["right_out"] = f"{branch_pce[('right', 'out')] * 60.0 / self.flow_window:.1f}"
                     self.worker_state["right_in_count"] = str(branch_count[('right', 'in')])
                     self.worker_state["right_out_count"] = str(branch_count[('right', 'out')])
+                    self.worker_state["bottom_in"] = f"{branch_pce[('bottom', 'in')] * 60.0 / self.flow_window:.1f}"
+                    self.worker_state["bottom_out"] = f"{branch_pce[('bottom', 'out')] * 60.0 / self.flow_window:.1f}"
+                    self.worker_state["bottom_in_count"] = str(branch_count[('bottom', 'in')])
+                    self.worker_state["bottom_out_count"] = str(branch_count[('bottom', 'out')])
 
                 expected_display = playback_start + (frame_id - 1) * frame_duration
                 delay = expected_display - time.time()
@@ -724,3 +761,4 @@ class FlowApp:
 if __name__ == "__main__":
     app = FlowApp()
     app.run()
+
