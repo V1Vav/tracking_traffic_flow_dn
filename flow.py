@@ -15,17 +15,19 @@ from ultralytics.models import YOLO
 
 
 CLASS_WEIGHTS = {
+    0: 0.2,   # bicycle
+    1: 0.3,   # motorcycle
     2: 1.0,   # car
-    3: 0.5,   # motorbike / motorcycle
-    5: 2.0,   # bus
-    7: 2.5    # truck
+    3: 2.0,   # bus
+    4: 2.0    # truck
 }
 
 CLASS_NAMES = {
+    0: "bicycle",
+    1: "motorcycle",
     2: "car",
-    3: "motorbike",
-    5: "bus",
-    7: "truck"
+    3: "bus",
+    4: "truck"
 }
 
 VALID_BRANCHES = {"top", "left", "right"}  # ignore one obscured branch (bottom)
@@ -227,12 +229,11 @@ class FlowApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.video_path_var = tk.StringVar(value="")
-        self.model_path_var = tk.StringVar(value="yolov8n.pt")
+        self.model_path_var = tk.StringVar(value="models/tuning.pt")
         self.template_image_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_IMAGE)
         self.template_mapping_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_MAPPING)
-        self.use_template_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
-        self.available_models = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt"]
+        self.available_models = ["models/yolov8n.pt", "models/yolov8s.pt", "models/yolov8m.pt", "models/yolov8l.pt", "models/yolov8x.pt", "models/tuning.pt"]
 
         self.region_template = None
 
@@ -254,10 +255,6 @@ class FlowApp:
             "right_out": tk.StringVar(value="0.0"),
             "right_in_count": tk.StringVar(value="0"),
             "right_out_count": tk.StringVar(value="0"),
-            "bottom_in": tk.StringVar(value="0.0"),
-            "bottom_out": tk.StringVar(value="0.0"),
-            "bottom_in_count": tk.StringVar(value="0"),
-            "bottom_out_count": tk.StringVar(value="0"),
         }
 
         self.worker_state = {
@@ -279,10 +276,6 @@ class FlowApp:
             "right_out": "0.0",
             "right_in_count": "0",
             "right_out_count": "0",
-            "bottom_in": "0.0",
-            "bottom_out": "0.0",
-            "bottom_in_count": "0",
-            "bottom_out_count": "0",
         }
 
         self.latest_pil_image = None
@@ -342,10 +335,8 @@ class FlowApp:
         mapping_entry.grid(row=7, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(control_frame, text="Browse...", command=self.browse_template_mapping).grid(row=7, column=1, sticky="ew")
 
-        ttk.Checkbutton(control_frame, text="Use template regions", variable=self.use_template_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=4)
-
         self.start_button = ttk.Button(control_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=9, column=0, columnspan=2, pady=8, sticky="ew")
+        self.start_button.grid(row=8, column=0, columnspan=2, pady=8, sticky="ew")
         self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_processing, state="disabled")
         self.stop_button.grid(row=9, column=0, columnspan=2, sticky="ew")
 
@@ -397,12 +388,6 @@ class FlowApp:
         ttk.Label(branch_frame, textvariable=self.metrics["right_out"], anchor="center").grid(row=3, column=2, sticky="ew", padx=4)
         ttk.Label(branch_frame, textvariable=self.metrics["right_in_count"], anchor="center").grid(row=3, column=3, sticky="ew", padx=4)
         ttk.Label(branch_frame, textvariable=self.metrics["right_out_count"], anchor="center").grid(row=3, column=4, sticky="ew", padx=4)
-
-        ttk.Label(branch_frame, text="Bottom").grid(row=4, column=0, sticky="w", padx=4)
-        ttk.Label(branch_frame, textvariable=self.metrics["bottom_in"], anchor="center").grid(row=4, column=1, sticky="ew", padx=4)
-        ttk.Label(branch_frame, textvariable=self.metrics["bottom_out"], anchor="center").grid(row=4, column=2, sticky="ew", padx=4)
-        ttk.Label(branch_frame, textvariable=self.metrics["bottom_in_count"], anchor="center").grid(row=4, column=3, sticky="ew", padx=4)
-        ttk.Label(branch_frame, textvariable=self.metrics["bottom_out_count"], anchor="center").grid(row=4, column=4, sticky="ew", padx=4)
 
         status_frame = ttk.Frame(right_frame)
         status_frame.pack(fill="x")
@@ -551,11 +536,7 @@ class FlowApp:
 
                 frame_id += 1
                 current_time = frame_id / fps_input
-                draw_region_overlay(
-                    frame,
-                    self.region_margin,
-                    self.region_template if self.use_template_var.get() else None,
-                )
+                draw_region_overlay(frame, self.region_margin, self.region_template)
                 new_events = []
                 detections = []
 
@@ -563,21 +544,21 @@ class FlowApp:
                     results = model(
                         frame,
                         imgsz=1280,
-                        conf=0.15,
+                        conf=0.25,
                         iou=0.45,
-                        classes=[2, 3, 5, 7],
+                        classes=[0, 1, 2, 3],
                         verbose=False,
                     )
                     for r in results:
                         for box in r.boxes:
                             cls = int(box.cls[0])
                             conf = float(box.conf[0])
-                            if cls not in CLASS_WEIGHTS:
-                                continue
-                            if cls == 3 and conf < 0.1:
-                                continue
-                            if cls != 3 and conf < 0.18:
-                                continue
+                            # if cls not in CLASS_WEIGHTS:
+                            #     continue
+                            # if cls == 3 and conf < 0.1:
+                            #     continue
+                            # if cls != 3 and conf < 0.18:
+                            #     continue
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             w, h = x2 - x1, y2 - y1
                             detections.append(([x1, y1, w, h], conf, cls))
@@ -595,11 +576,7 @@ class FlowApp:
                     cls = track.det_class
                     centroid = centroid_from_box((l, t, r, b))
                     current_region = get_direction_region(
-                        centroid,
-                        frame.shape[1],
-                        frame.shape[0],
-                        self.region_margin,
-                        self.region_template if self.use_template_var.get() else None,
+                        centroid, frame.shape[1], frame.shape[0], self.region_margin, self.region_template
                     )
 
                     meta = track_meta.setdefault(track_id, {
@@ -639,10 +616,10 @@ class FlowApp:
 
                     meta["last_region"] = current_region
                     color = {
-                        2: (0, 255, 0),
-                        3: (255, 0, 0),
-                        5: (0, 0, 255),
-                        7: (0, 255, 255),
+                        0: (0, 255, 0),
+                        1: (255, 0, 0),
+                        2: (0, 0, 255),
+                        3: (0, 255, 255),
                     }.get(cls, (255, 255, 255))
                     label = f"{CLASS_NAMES.get(cls, cls)} #{track_id}"
                     cv2.rectangle(frame, (l, t), (r, b), color, 2)
