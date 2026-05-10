@@ -1,6 +1,5 @@
-yellow, up
-red, down
-green, left
-orange, right
-blue, center
-white, none
+1280, 720
+top,271,1,451,3,526,55,256,50
+down,226,276,815,294,1241,717,172,718
+left,3,180,173,177,174,70,4,58
+right,820,242,995,271,932,210,710,161

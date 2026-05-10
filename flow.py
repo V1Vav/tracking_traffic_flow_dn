@@ -3,7 +3,7 @@ import time
 import os
 import csv
 import numpy as np
-from collections import Counter, deque
+from collections import deque
 from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -54,17 +54,12 @@ DEFAULT_TEMPLATE_MAPPING = "template.csv"
 
 
 class RegionTemplate:
-    def __init__(self, image_path, mapping_path):
-        self.image_path = image_path
+    def __init__(self, mapping_path):
         self.mapping_path = mapping_path
-        self.template = None
-        self.color_to_region = {}
+        self.regions = {}  # region_name -> list of (x,y) points
+        self.resolution = None
         self.loaded = False
-        self.resize_cache = None
-        self.resized_template = None
-        self.label_positions = {}
         self._load_mapping()
-        self._load_image()
 
     def _load_mapping(self):
         if not self.mapping_path or not os.path.exists(self.mapping_path):
@@ -72,44 +67,39 @@ class RegionTemplate:
         try:
             with open(self.mapping_path, newline='', encoding='utf-8') as csvfile:
                 reader = csv.reader(csvfile)
-                for row in reader:
-                    if len(row) < 2:
+                lines = list(reader)
+                if not lines:
+                    return
+                # First line: resolution
+                res_line = lines[0]
+                if len(res_line) >= 2:
+                    self.resolution = (int(res_line[0]), int(res_line[1]))
+                # Subsequent lines: region_name, x1,y1,x2,y2,x3,y3,x4,y4
+                for row in lines[1:]:
+                    if len(row) < 9:
                         continue
-                    color_name = row[0].strip().lower()
-                    region_name = row[1].strip().lower()
-                    region = REGION_NAME_MAP.get(region_name)
-                    color_bgr = COLOR_NAME_TO_BGR.get(color_name)
-                    if region and color_bgr is not None:
-                        self.color_to_region[color_bgr] = region
-        except Exception:
-            self.color_to_region = {}
+                    region_name = row[0].strip().lower()
+                    points = []
+                    for i in range(1, 9, 2):
+                        x = int(row[i].strip())
+                        y = int(row[i+1].strip())
+                        points.append((x, y))
+                    if len(points) == 4:
+                        region = REGION_NAME_MAP.get(region_name, region_name)
+                        self.regions[region] = points
+                        print(f"Loaded region {region}: {points}")
+            self.loaded = bool(self.regions)
+            print(f"RegionTemplate loaded: {self.loaded}, regions: {list(self.regions.keys())}")
+        except Exception as e:
+            print(f"Error loading mapping: {e}")
+            self.regions = {}
 
-    def _load_image(self):
-        if not self.image_path or not os.path.exists(self.image_path):
-            return
-        template = cv2.imread(self.image_path)
-        if template is None:
-            return
-        self.template = template
-        self.loaded = bool(self.template is not None and self.color_to_region)
-
-    def _ensure_resized(self, width, height):
-        if self.resize_cache == (width, height):
-            return
-        self.resize_cache = (width, height)
-        self.resized_template = cv2.resize(
-            self.template, (width, height), interpolation=cv2.INTER_NEAREST
-        )
-        self.label_positions = {}
-        for color, region in self.color_to_region.items():
-            lower = np.array(color, dtype=np.uint8)
-            upper = np.array(color, dtype=np.uint8)
-            mask = cv2.inRange(self.resized_template, lower, upper)
-            moments = cv2.moments(mask)
-            if moments["m00"] != 0:
-                cx = int(moments["m10"] / moments["m00"])
-                cy = int(moments["m01"] / moments["m00"])
-                self.label_positions[region] = (cx, cy)
+    def _scale_points(self, points, frame_width, frame_height):
+        if not self.resolution or (frame_width == self.resolution[0] and frame_height == self.resolution[1]):
+            return points
+        scale_x = frame_width / self.resolution[0]
+        scale_y = frame_height / self.resolution[1]
+        return [(int(x * scale_x), int(y * scale_y)) for x, y in points]
 
     def get_region(self, centroid, width, height):
         if not self.loaded:
@@ -117,32 +107,28 @@ class RegionTemplate:
         x, y = centroid
         if x < 0 or y < 0 or x >= width or y >= height:
             return None
-        self._ensure_resized(width, height)
-        pixel = tuple(int(v) for v in self.resized_template[y, x])
-        region = self.color_to_region.get(pixel)
-        if region:
-            return region
-        best_region = None
-        best_dist = float('inf')
-        px = np.array(pixel, dtype=np.int32)
-        for color, region_name in self.color_to_region.items():
-            dist = np.linalg.norm(px - np.array(color, dtype=np.int32))
-            if dist < best_dist:
-                best_dist = dist
-                best_region = region_name
-        return best_region if best_dist < 30 else None
+        scaled_regions = {name: self._scale_points(pts, width, height) for name, pts in self.regions.items()}
+        for region_name, points in scaled_regions.items():
+            contour = np.array(points, dtype=np.int32)
+            if cv2.pointPolygonTest(contour, (x, y), False) >= 0:
+                return region_name
+        return None
 
-    def overlay(self, frame, alpha=0.15):
+    def overlay(self, frame):
         if not self.loaded:
             return
         height, width = frame.shape[:2]
-        self._ensure_resized(width, height)
-        overlay = self.resized_template.copy()
-        mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-        frame[:] = cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0)
-        for region, pos in self.label_positions.items():
-            cv2.putText(frame, region.upper(), (pos[0] - 40, pos[1]), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, (255, 255, 255), 2)
+        scaled_regions = {name: self._scale_points(pts, width, height) for name, pts in self.regions.items()}
+        for region_name, points in scaled_regions.items():
+            contour = np.array(points, dtype=np.int32)
+            cv2.polylines(frame, [contour], True, (0, 255, 0), 3)
+            # Label position: centroid of the polygon
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                cv2.putText(frame, region_name.upper(), (cx - 30, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, (0, 0, 0), 2)
 
 
 def centroid_from_box(box):
@@ -153,8 +139,11 @@ def centroid_from_box(box):
 def get_direction_region(centroid, width, height, margin_fraction, template=None):
     if template and template.loaded:
         region = template.get_region(centroid, width, height)
-        if region:
+        if region is not None:
             return region
+        # If a custom template is loaded but the centroid is not inside any mapped region,
+        # treat it as center instead of falling back to margin-based branch classification.
+        return "center"
     x, y = centroid
     left_margin = int(width * margin_fraction)
     right_margin = int(width * (1.0 - margin_fraction))
@@ -176,39 +165,15 @@ def get_direction_region(centroid, width, height, margin_fraction, template=None
 
 def draw_region_overlay(frame, margin_fraction, template=None):
     if template and template.loaded:
-        template.overlay(frame, alpha=0.20)
+        template.overlay(frame)
         return
-    height, width = frame.shape[:2]
-    left_margin = int(width * margin_fraction)
-    right_margin = int(width * (1.0 - margin_fraction))
-    top_margin = int(height * margin_fraction)
-    bottom_margin = int(height * (1.0 - margin_fraction))
-
-    color = (220, 220, 220)
-    thickness = 1
-    cv2.line(frame, (left_margin, 0), (left_margin, height), color, thickness)
-    cv2.line(frame, (right_margin, 0), (right_margin, height), color, thickness)
-    cv2.line(frame, (0, top_margin), (width, top_margin), color, thickness)
-    cv2.line(frame, (0, bottom_margin), (width, bottom_margin), color, thickness)
-
-    text_color = (240, 240, 240)
-    text_scale = 0.6
-    text_thickness = 2
-
-    cv2.putText(frame, "TOP", (left_margin + 10, top_margin // 2), cv2.FONT_HERSHEY_SIMPLEX,
-                text_scale, text_color, text_thickness)
-    cv2.putText(frame, "LEFT", (10, bottom_margin - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                text_scale, text_color, text_thickness)
-    cv2.putText(frame, "CENTER", (left_margin + 10, top_margin + 30), cv2.FONT_HERSHEY_SIMPLEX,
-                text_scale, text_color, text_thickness)
-    cv2.putText(frame, "RIGHT", (right_margin + 10, bottom_margin - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                text_scale, text_color, text_thickness)
-    cv2.putText(frame, "BOTTOM", (left_margin + 10, bottom_margin + 30), cv2.FONT_HERSHEY_SIMPLEX,
-                text_scale, text_color, text_thickness)
 
 
-def format_flow_metrics(event_window, window_seconds, active_track_ids):
-    filtered_events = [event for event in event_window if event["track_id"] in active_track_ids]
+def format_flow_metrics(event_window, window_seconds, active_track_ids=None):
+    if active_track_ids is None:
+        filtered_events = list(event_window)
+    else:
+        filtered_events = [event for event in event_window if event["track_id"] in active_track_ids]
     count = len(filtered_events)
     weighted_sum = sum(event["weight"] for event in filtered_events)
     if window_seconds <= 0:
@@ -232,7 +197,6 @@ class FlowApp:
 
         self.video_path_var = tk.StringVar(value="")
         self.model_path_var = tk.StringVar(value="models/tuning.pt")
-        self.template_image_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_IMAGE)
         self.template_mapping_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_MAPPING)
         self.status_var = tk.StringVar(value="Ready")
         self.available_models = ["models/yolov8n.pt", "models/yolov8s.pt", "models/yolov8m.pt", "models/yolov8l.pt", "models/yolov8x.pt", "models/tuning.pt"]
@@ -262,6 +226,22 @@ class FlowApp:
             "bottom_out": tk.StringVar(value="0.0"),
             "bottom_in_count": tk.StringVar(value="0"),
             "bottom_out_count": tk.StringVar(value="0"),
+            "top_car_in": tk.StringVar(value="0"),
+            "top_car_out": tk.StringVar(value="0"),
+            "top_moto_in": tk.StringVar(value="0"),
+            "top_moto_out": tk.StringVar(value="0"),
+            "left_car_in": tk.StringVar(value="0"),
+            "left_car_out": tk.StringVar(value="0"),
+            "left_moto_in": tk.StringVar(value="0"),
+            "left_moto_out": tk.StringVar(value="0"),
+            "right_car_in": tk.StringVar(value="0"),
+            "right_car_out": tk.StringVar(value="0"),
+            "right_moto_in": tk.StringVar(value="0"),
+            "right_moto_out": tk.StringVar(value="0"),
+            "bottom_car_in": tk.StringVar(value="0"),
+            "bottom_car_out": tk.StringVar(value="0"),
+            "bottom_moto_in": tk.StringVar(value="0"),
+            "bottom_moto_out": tk.StringVar(value="0"),
         }
 
         self.worker_state = {
@@ -287,6 +267,22 @@ class FlowApp:
             "bottom_out": "0.0",
             "bottom_in_count": "0",
             "bottom_out_count": "0",
+            "top_car_in": "0",
+            "top_car_out": "0",
+            "top_moto_in": "0",
+            "top_moto_out": "0",
+            "left_car_in": "0",
+            "left_car_out": "0",
+            "left_moto_in": "0",
+            "left_moto_out": "0",
+            "right_car_in": "0",
+            "right_car_out": "0",
+            "right_moto_in": "0",
+            "right_moto_out": "0",
+            "bottom_car_in": "0",
+            "bottom_car_out": "0",
+            "bottom_moto_in": "0",
+            "bottom_moto_out": "0",
         }
 
         self.latest_pil_image = None
@@ -336,23 +332,18 @@ class FlowApp:
         model_combo.grid(row=3, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(control_frame, text="Browse...", command=self.browse_model).grid(row=3, column=1, sticky="ew")
 
-        ttk.Label(control_frame, text="Template image:").grid(row=4, column=0, sticky="w", pady=4)
-        template_entry = ttk.Entry(control_frame, textvariable=self.template_image_path_var, width=36)
+        ttk.Label(control_frame, text="Template CSV:").grid(row=4, column=0, sticky="w", pady=4)
+        template_entry = ttk.Entry(control_frame, textvariable=self.template_mapping_path_var, width=36)
         template_entry.grid(row=5, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(control_frame, text="Browse...", command=self.browse_template).grid(row=5, column=1, sticky="ew")
-
-        ttk.Label(control_frame, text="Template CSV:").grid(row=6, column=0, sticky="w", pady=4)
-        mapping_entry = ttk.Entry(control_frame, textvariable=self.template_mapping_path_var, width=36)
-        mapping_entry.grid(row=7, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(control_frame, text="Browse...", command=self.browse_template_mapping).grid(row=7, column=1, sticky="ew")
+        ttk.Button(control_frame, text="Browse...", command=self.browse_template_mapping).grid(row=5, column=1, sticky="ew")
 
         ttk.Checkbutton(control_frame, text="Display Region Template",
-                            variable=self.display_template_var).grid(row=8, column=0, columnspan=2, sticky="ew", pady=4)
+                            variable=self.display_template_var).grid(row=6, column=0, columnspan=2, sticky="ew", pady=4)
 
         self.start_button = ttk.Button(control_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=9, column=0, columnspan=2, pady=8, sticky="ew")
+        self.start_button.grid(row=7, column=0, columnspan=2, pady=8, sticky="ew")
         self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.grid(row=10, column=0, columnspan=2, sticky="ew")
+        self.stop_button.grid(row=8, column=0, columnspan=2, sticky="ew")
 
         for child in control_frame.winfo_children():
             child.grid_configure(padx=2, pady=2)
@@ -409,6 +400,43 @@ class FlowApp:
         ttk.Label(branch_frame, textvariable=self.metrics["bottom_in_count"], anchor="center").grid(row=4, column=3, sticky="ew", padx=4)
         ttk.Label(branch_frame, textvariable=self.metrics["bottom_out_count"], anchor="center").grid(row=4, column=4, sticky="ew", padx=4)
 
+        vehicle_frame = ttk.LabelFrame(metrics_frame, text="Vehicle Type Count")
+        vehicle_frame.grid(row=row + 1, column=0, columnspan=2, sticky="ew", pady=(8, 0), padx=2)
+        vehicle_frame.grid_columnconfigure(1, weight=1)
+        vehicle_frame.grid_columnconfigure(2, weight=1)
+        vehicle_frame.grid_columnconfigure(3, weight=1)
+        vehicle_frame.grid_columnconfigure(4, weight=1)
+
+        ttk.Label(vehicle_frame, text="Direction").grid(row=0, column=0, sticky="w", padx=4)
+        ttk.Label(vehicle_frame, text="Car In", anchor="center").grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, text="Car Out", anchor="center").grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, text="Moto In", anchor="center").grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, text="Moto Out", anchor="center").grid(row=0, column=4, sticky="ew", padx=4)
+
+        ttk.Label(vehicle_frame, text="Top").grid(row=1, column=0, sticky="w", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["top_car_in"], anchor="center").grid(row=1, column=1, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["top_car_out"], anchor="center").grid(row=1, column=2, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["top_moto_in"], anchor="center").grid(row=1, column=3, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["top_moto_out"], anchor="center").grid(row=1, column=4, sticky="ew", padx=4)
+
+        ttk.Label(vehicle_frame, text="Left").grid(row=2, column=0, sticky="w", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["left_car_in"], anchor="center").grid(row=2, column=1, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["left_car_out"], anchor="center").grid(row=2, column=2, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["left_moto_in"], anchor="center").grid(row=2, column=3, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["left_moto_out"], anchor="center").grid(row=2, column=4, sticky="ew", padx=4)
+
+        ttk.Label(vehicle_frame, text="Right").grid(row=3, column=0, sticky="w", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["right_car_in"], anchor="center").grid(row=3, column=1, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["right_car_out"], anchor="center").grid(row=3, column=2, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["right_moto_in"], anchor="center").grid(row=3, column=3, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["right_moto_out"], anchor="center").grid(row=3, column=4, sticky="ew", padx=4)
+
+        ttk.Label(vehicle_frame, text="Bottom").grid(row=4, column=0, sticky="w", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["bottom_car_in"], anchor="center").grid(row=4, column=1, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["bottom_car_out"], anchor="center").grid(row=4, column=2, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["bottom_moto_in"], anchor="center").grid(row=4, column=3, sticky="ew", padx=4)
+        ttk.Label(vehicle_frame, textvariable=self.metrics["bottom_moto_out"], anchor="center").grid(row=4, column=4, sticky="ew", padx=4)
+
         status_frame = ttk.Frame(right_frame)
         status_frame.pack(fill="x")
         ttk.Label(status_frame, text="Status:").grid(row=0, column=0, sticky="w")
@@ -430,15 +458,6 @@ class FlowApp:
         if model_path:
             self.model_path_var.set(model_path)
 
-    def browse_template(self):
-        template_path = filedialog.askopenfilename(
-            title="Select template image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg"), ("All files", "*")]
-        )
-        if template_path:
-            self.template_image_path_var.set(template_path)
-            self.load_region_template()
-
     def browse_template_mapping(self):
         mapping_path = filedialog.askopenfilename(
             title="Select template mapping CSV",
@@ -449,10 +468,9 @@ class FlowApp:
             self.load_region_template()
 
     def load_region_template(self):
-        image_path = self.template_image_path_var.get().strip()
         mapping_path = self.template_mapping_path_var.get().strip()
-        if image_path and mapping_path and os.path.exists(image_path) and os.path.exists(mapping_path):
-            self.region_template = RegionTemplate(image_path, mapping_path)
+        if mapping_path and os.path.exists(mapping_path):
+            self.region_template = RegionTemplate(mapping_path)
             if self.region_template.loaded:
                 self.status_var.set("Template loaded")
                 return
@@ -540,8 +558,27 @@ class FlowApp:
             with self.state_lock:
                 self.worker_state["status"] = f"Buffer ready @ {fps_input:.1f} FPS"
 
-            flow_events = deque()
+            valid_branches = set(self.region_template.regions.keys()) if self.region_template else set()
             track_meta = {}
+            # Persistent counters for each branch
+            # branch_pce_current: current PCE (recalc each frame based on vehicles in region) - display only
+            branch_pce_current = {
+                (branch, direction): 0.0
+                for branch in valid_branches
+                for direction in ("in", "out")
+            }
+            # branch_count_total: accumulate vehicle count entered/exited
+            branch_count_total = {
+                (branch, direction): 0
+                for branch in valid_branches
+                for direction in ("in", "out")
+            }
+            branch_class_count_total = {
+                (branch, direction, cls_id): 0
+                for branch in valid_branches
+                for direction in ("in", "out")
+                for cls_id in CLASS_WEIGHTS.keys()
+            }
             prev_time = time.time()
             playback_start = time.time()
             frame_id = 0
@@ -556,9 +593,12 @@ class FlowApp:
 
                 frame_id += 1
                 current_time = frame_id / fps_input
-                if self.display_template_var.get():
-                    draw_region_overlay(frame, self.region_margin, self.region_template)
-                new_events = []
+                overlay_template = self.region_template if self.display_template_var.get() else None
+                draw_region_overlay(
+                    frame,
+                    self.region_margin,
+                    overlay_template,
+                )
                 detections = []
 
                 if frame_id % self.detect_interval == 0:
@@ -580,11 +620,6 @@ class FlowApp:
                                 continue
                             if cls != 2 and conf < 0.15:
                                 continue
-                            # 0: 0.2,   # bicycle
-                            # 1: 0.3,   # motorcycle
-                            # 2: 1.0,   # car
-                            # 3: 2.0,   # bus
-                            # 4: 2.0    # truck
                             x1, y1, x2, y2 = map(int, box.xyxy[0])
                             w, h = x2 - x1, y2 - y1
                             detections.append(([x1, y1, w, h], conf, cls))
@@ -593,56 +628,85 @@ class FlowApp:
                 active_tracks = 0
                 active_track_ids = set()
 
+                print(f"[DeepSort] Frame={frame_id} detections={len(detections)} total_tracks={len(tracks)}")
+
+                # First pass: collect active track ids
                 for track in tracks:
                     if not track.is_confirmed() or track.time_since_update > 5:
+                        continue
+                    active_track_ids.add(track.track_id)
+
+                # Second pass: cleanup old tracks and detect exits
+                tracks_to_remove = []
+                for track_id, meta in track_meta.items():
+                    if track_id not in active_track_ids:
+                        # Track lost - count out if it was in a region
+                        if meta["previous_region"] in valid_branches:
+                            branch_count_total[(meta["previous_region"], "out")] += 1
+                            cls = meta.get("cls", 2)  # default to car
+                            branch_class_count_total[(meta["previous_region"], "out", cls)] += 1
+                            print(f"[Flow] Count OUT (lost): {meta['previous_region']} track_id={track_id}")
+                        tracks_to_remove.append(track_id)
+
+                # Remove lost tracks from metadata
+                for track_id in tracks_to_remove:
+                    del track_meta[track_id]
+
+                # Process active tracks
+                for track in tracks:
+                    if not track.is_confirmed() or track.time_since_update > 5:
+                        print(f"[DeepSort]   Skipping track {track.track_id} confirmed={track.is_confirmed()} time_since_update={track.time_since_update}")
                         continue
 
                     active_tracks += 1
                     track_id = track.track_id
-                    active_track_ids.add(track_id)
                     l, t, r, b = map(int, track.to_ltrb())
                     cls = track.det_class
                     centroid = centroid_from_box((l, t, r, b))
                     current_region = get_direction_region(
-                        centroid, frame.shape[1], frame.shape[0], self.region_margin, self.region_template
+                        centroid,
+                        frame.shape[1],
+                        frame.shape[0],
+                        self.region_margin,
+                        self.region_template,
                     )
 
                     meta = track_meta.setdefault(track_id, {
-                        "last_region": current_region,
-                        "seen_center": current_region == "center",
+                        "first_region": None,
+                        "previous_region": None,
+                        "current_region": None,
+                        "weight": 0.0,
+                        "counted_in": False,
+                        "cls": cls,
                     })
 
-                    direction = None
-                    branch = None
+                    # Initialize on first detection
+                    if meta["first_region"] is None:
+                        meta["first_region"] = current_region
+                        meta["previous_region"] = current_region
+                        meta["cls"] = cls
 
-                    if current_region == "center" and meta["last_region"] in VALID_BRANCHES:
-                        direction = "in"
-                        branch = meta["last_region"]
-                    elif current_region in VALID_BRANCHES and meta["last_region"] == "center":
-                        direction = "out"
-                        branch = current_region
-
-                    if direction is not None and branch is not None:
-                        weight = CLASS_WEIGHTS.get(cls, 1.0)
-                        event = {
-                            "time": current_time,
-                            "track_id": track_id,
-                            "class": cls,
-                            "branch": branch,
-                            "direction": direction,
-                            "weight": weight,
-                            "bbox": (l, t, r, b),
-                        }
-                        flow_events.append(event)
-                        new_events.append(event)
-
-                    if current_region == "outside":
-                        meta["seen_center"] = False
-
-                    if current_region == "center":
-                        meta["seen_center"] = True
-
-                    meta["last_region"] = current_region
+                    # Update current region and weight
+                    weight = CLASS_WEIGHTS.get(cls, 1.0)
+                    meta["weight"] = weight
+                    
+                    # Check if vehicle entered a region (first time in valid branch)
+                    if current_region in valid_branches and not meta["counted_in"]:
+                        branch_count_total[(current_region, "in")] += 1
+                        branch_class_count_total[(current_region, "in", cls)] += 1
+                        meta["counted_in"] = True
+                        print(f"[Flow] Count IN: {current_region} cls={cls} track_id={track_id}")
+                    
+                    # Check if vehicle left a region while still active (region changed, not lost)
+                    if meta["previous_region"] in valid_branches and current_region != meta["previous_region"] and meta["counted_in"]:
+                        branch_count_total[(meta["previous_region"], "out")] += 1
+                        branch_class_count_total[(meta["previous_region"], "out", cls)] += 1
+                        meta["counted_in"] = False  # Reset for potential re-entry
+                        print(f"[Flow] Count OUT (region change): {meta['previous_region']} -> {current_region} cls={cls} track_id={track_id}")
+                    
+                    # Update previous region for next frame
+                    meta["previous_region"] = current_region
+                    meta["current_region"] = current_region
                     color = {
                         0: (0, 255, 0),
                         1: (255, 0, 0),
@@ -653,33 +717,20 @@ class FlowApp:
                     cv2.rectangle(frame, (l, t), (r, b), color, 2)
                     cv2.putText(frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     cv2.circle(frame, centroid, 3, color, -1)
+                    print(
+                        f"[DeepSort]   Track={track_id} cls={cls} label={CLASS_NAMES.get(cls, cls)} "
+                        f"ltrb=({l},{t},{r},{b}) centroid={centroid} region={current_region} confirmed={track.is_confirmed()} "
+                        f"time_since_update={track.time_since_update}"
+                    )
+
+                # Recalculate current PCE based on vehicles currently in each region
+                for branch in valid_branches:
+                    branch_pce_current[(branch, "in")] = sum(meta["weight"] for meta in track_meta.values() 
+                                                             if meta["current_region"] == branch)
 
                 curr_time = time.time()
                 fps = 1 / (curr_time - prev_time) if curr_time > prev_time else 0.0
                 prev_time = curr_time
-
-                active_track_ids = {track.track_id for track in tracks if track.is_confirmed() and track.time_since_update <= 5}
-                cleanup_old_events(flow_events, current_time, self.flow_window)
-                flow_pce_pm, flow_veh_pm = format_flow_metrics(flow_events, self.flow_window, active_track_ids)
-                branch_pce = {
-                    (branch, direction): 0.0
-                    for branch in VALID_BRANCHES
-                    for direction in ("in", "out")
-                }
-                branch_count = {
-                    (branch, direction): 0
-                    for branch in VALID_BRANCHES
-                    for direction in ("in", "out")
-                }
-                for event in flow_events:
-                    if event["track_id"] not in active_track_ids:
-                        continue
-                    key = (event["branch"], event["direction"])
-                    if key in branch_pce:
-                        branch_pce[key] += event["weight"]
-                        branch_count[key] += 1
-
-                curr_time = time.time()
 
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(rgb_frame)
@@ -691,24 +742,26 @@ class FlowApp:
                     self.worker_state["frame"] = str(frame_id)
                     self.worker_state["fps"] = f"{fps:.1f}"
                     self.worker_state["active_tracks"] = str(active_tracks)
-                    self.worker_state["flow_pce_pm"] = f"{flow_pce_pm:.1f}"
-                    self.worker_state["flow_veh_pm"] = f"{flow_veh_pm:.0f}"
-                    self.worker_state["top_in"] = f"{branch_pce[('top', 'in')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["top_out"] = f"{branch_pce[('top', 'out')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["top_in_count"] = str(branch_count[('top', 'in')])
-                    self.worker_state["top_out_count"] = str(branch_count[('top', 'out')])
-                    self.worker_state["left_in"] = f"{branch_pce[('left', 'in')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["left_out"] = f"{branch_pce[('left', 'out')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["left_in_count"] = str(branch_count[('left', 'in')])
-                    self.worker_state["left_out_count"] = str(branch_count[('left', 'out')])
-                    self.worker_state["right_in"] = f"{branch_pce[('right', 'in')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["right_out"] = f"{branch_pce[('right', 'out')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["right_in_count"] = str(branch_count[('right', 'in')])
-                    self.worker_state["right_out_count"] = str(branch_count[('right', 'out')])
-                    self.worker_state["bottom_in"] = f"{branch_pce[('bottom', 'in')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["bottom_out"] = f"{branch_pce[('bottom', 'out')] * 60.0 / self.flow_window:.1f}"
-                    self.worker_state["bottom_in_count"] = str(branch_count[('bottom', 'in')])
-                    self.worker_state["bottom_out_count"] = str(branch_count[('bottom', 'out')])
+                    # Total flow (current PCE + accumulated count)
+                    total_pce = sum(v for k, v in branch_pce_current.items() if k[1] == "in")
+                    total_veh = sum(v for k, v in branch_count_total.items() if k[1] == "in")
+                    self.worker_state["flow_pce_pm"] = f"{total_pce:.1f}"
+                    self.worker_state["flow_veh_pm"] = f"{total_veh:.0f}"
+                    # Update metrics for each branch (current PCE, accumulated count)
+                    for branch in valid_branches:
+                        self.worker_state[f"{branch}_in"] = f"{branch_pce_current[(branch, 'in')]:.1f}"
+                        self.worker_state[f"{branch}_out"] = f"{branch_pce_current[(branch, 'out')]:.1f}"
+                        self.worker_state[f"{branch}_in_count"] = str(branch_count_total[(branch, 'in')])
+                        self.worker_state[f"{branch}_out_count"] = str(branch_count_total[(branch, 'out')])
+                        self.worker_state[f"{branch}_car_in"] = str(branch_class_count_total.get((branch, 'in', 2), 0))
+                        self.worker_state[f"{branch}_car_out"] = str(branch_class_count_total.get((branch, 'out', 2), 0))
+                        self.worker_state[f"{branch}_moto_in"] = str(branch_class_count_total.get((branch, 'in', 1), 0))
+                        self.worker_state[f"{branch}_moto_out"] = str(branch_class_count_total.get((branch, 'out', 1), 0))
+
+                expected_display = playback_start + (frame_id - 1) * frame_duration
+                delay = expected_display - time.time()
+                if delay > 0:
+                    time.sleep(delay)
 
                 expected_display = playback_start + (frame_id - 1) * frame_duration
                 delay = expected_display - time.time()
