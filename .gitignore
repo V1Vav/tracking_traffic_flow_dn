@@ -4,6 +4,7 @@ data_international/
 data_dn/
 ouput_video/
 temp/
+*/backup/
 
 # Python artifacts
 __pycache__/

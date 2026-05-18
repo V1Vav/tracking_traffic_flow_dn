@@ -11,6 +11,7 @@ from .config import (
     BRANCH_ORDER,
     CLASS_NAMES,
     DEFAULT_AVAILABLE_MODELS,
+    DEFAULT_MODEL_PATH,
     DEFAULT_TEMPLATE_MAPPING,
     DISPLAY_CLASS_IDS,
 )
@@ -26,7 +27,7 @@ class FlowApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.video_path_var = tk.StringVar(value="")
-        self.model_path_var = tk.StringVar(value="models/tuning.pt")
+        self.model_path_var = tk.StringVar(value=DEFAULT_MODEL_PATH)
         self.template_mapping_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_MAPPING)
         self.status_var = tk.StringVar(value="Ready")
         self.available_models = DEFAULT_AVAILABLE_MODELS
@@ -62,12 +63,13 @@ class FlowApp:
             "fps": "0.0",
             "active_tracks": "0",
             "current_pce": "0.0",
-            "flow_veh_pm": "0.0",
+            "flow_veh_pm": "0",
         }
 
         for branch in BRANCH_ORDER:
             state.update({
                 f"{branch}_pce": "0.0",
+                f"{branch}_count": "0",
                 f"{branch}_in_flow": "0.0",
                 f"{branch}_out_flow": "0.0",
                 f"{branch}_in_count": "0",
@@ -97,7 +99,7 @@ class FlowApp:
         control_frame = ttk.LabelFrame(right_frame, text="Controls")
         control_frame.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(control_frame, text="Video:").grid(row=0, column=0, sticky="w", pady=4)
+        ttk.Label(control_frame, text="Video / Camera / Stream:").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(control_frame, textvariable=self.video_path_var, width=36).grid(row=1, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(control_frame, text="Browse...", command=self.browse_video).grid(row=1, column=1, sticky="ew")
 
@@ -137,14 +139,14 @@ class FlowApp:
             ("FPS:", "fps"),
             ("Active tracks:", "active_tracks"),
             ("Current PCE:", "current_pce"),
-            ("Flow (veh/min):", "flow_veh_pm"),
+            ("Total veh:", "flow_veh_pm"),
         ]):
             ttk.Label(metrics_frame, text=label_text).grid(row=row, column=0, sticky="w", pady=4)
             ttk.Label(metrics_frame, textvariable=self.metrics[var_name], width=28).grid(row=row, column=1, sticky="w")
 
-        branch_frame = ttk.LabelFrame(metrics_frame, text="Branch Current PCE + Flow + Count")
+        branch_frame = ttk.LabelFrame(metrics_frame, text="Branch Current PCE + Count")
         branch_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0), padx=2)
-        headers = ["Direction", "PCE now", "In veh/min", "Out veh/min", "In total", "Out total"]
+        headers = ["Direction", "PCE now", "Count now"]
         for col, header in enumerate(headers):
             branch_frame.grid_columnconfigure(col, weight=1)
             ttk.Label(branch_frame, text=header, anchor="center").grid(row=0, column=col, sticky="ew", padx=2)
@@ -152,12 +154,9 @@ class FlowApp:
         for row, branch in enumerate(BRANCH_ORDER, start=1):
             ttk.Label(branch_frame, text=branch.title()).grid(row=row, column=0, sticky="w", padx=4)
             ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_pce"], anchor="center").grid(row=row, column=1, sticky="ew", padx=2)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_in_flow"], anchor="center").grid(row=row, column=2, sticky="ew", padx=2)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_out_flow"], anchor="center").grid(row=row, column=3, sticky="ew", padx=2)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_in_count"], anchor="center").grid(row=row, column=4, sticky="ew", padx=2)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_out_count"], anchor="center").grid(row=row, column=5, sticky="ew", padx=2)
+            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_count"], anchor="center").grid(row=row, column=2, sticky="ew", padx=2)
 
-        vehicle_frame = ttk.LabelFrame(metrics_frame, text="Vehicle Type Count")
+        vehicle_frame = ttk.LabelFrame(metrics_frame, text="Vehicle Type Count Total")
         vehicle_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0), padx=2)
         vehicle_headers = ["Direction", "Car In", "Car Out", "Moto In", "Moto Out"]
         for col, header in enumerate(vehicle_headers):
@@ -220,7 +219,7 @@ class FlowApp:
         model_path = self.model_path_var.get().strip()
 
         if not video_path:
-            messagebox.showwarning("Missing video", "Please choose a video file first.")
+            messagebox.showwarning("Missing video", "Please choose a video file, type camera index like 0, or paste RTSP/HTTP stream URL.")
             return
         if not model_path:
             messagebox.showwarning("Missing model", "Please choose a YOLO model file first.")

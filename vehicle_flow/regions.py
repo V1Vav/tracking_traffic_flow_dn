@@ -17,6 +17,22 @@ class RegionTemplate:
         self.loaded = False
         self._load_mapping()
 
+    def _parse_point_row(self, row):
+        """Parse any row formatted as name,x1,y1,x2,y2,...
+
+        Older templates used 4 points per region. The center region can now use
+        8 points, so this parser accepts any polygon with at least 4 points.
+        Empty cells are ignored to keep old CSV files compatible.
+        """
+        values = [cell.strip() for cell in row[1:] if cell.strip() != ""]
+        if len(values) < 8 or len(values) % 2 != 0:
+            return []
+
+        points = []
+        for i in range(0, len(values), 2):
+            points.append((int(float(values[i])), int(float(values[i + 1]))))
+        return points
+
     def _load_mapping(self):
         if not self.mapping_path or not os.path.exists(self.mapping_path):
             return
@@ -29,7 +45,7 @@ class RegionTemplate:
                 return
 
             if len(rows[0]) >= 2:
-                self.resolution = (int(rows[0][0]), int(rows[0][1]))
+                self.resolution = (int(float(rows[0][0])), int(float(rows[0][1])))
 
             for row in rows[1:]:
                 if len(row) < 9:
@@ -40,11 +56,9 @@ class RegionTemplate:
                 if region is None:
                     continue
 
-                points = []
-                for i in range(1, 9, 2):
-                    points.append((int(row[i].strip()), int(row[i + 1].strip())))
+                points = self._parse_point_row(row)
 
-                if len(points) == 4:
+                if len(points) >= 4:
                     self.regions[region] = points
                     print(f"Loaded region {region}: {points}")
 
@@ -73,7 +87,14 @@ class RegionTemplate:
         if x < 0 or y < 0 or x >= width or y >= height:
             return None
 
-        for region_name, points in self.regions.items():
+        # Check center first when it is explicitly present. This prevents a
+        # center point that lies on a shared border from being captured by one
+        # of the outer regions before the center polygon is tested.
+        region_order = ["center"] if "center" in self.regions else []
+        region_order += [name for name in self.regions.keys() if name != "center"]
+
+        for region_name in region_order:
+            points = self.regions[region_name]
             scaled = self._scale_points(points, width, height)
             contour = np.array(scaled, dtype=np.int32)
             if cv2.pointPolygonTest(contour, (x, y), False) >= 0:
