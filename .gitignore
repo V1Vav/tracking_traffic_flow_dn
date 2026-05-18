@@ -1,5 +1,6 @@
 # Ignore dataset and generated output files
 Dataset/
+data_international/
 data_dn/
 ouput_video/
 temp/
