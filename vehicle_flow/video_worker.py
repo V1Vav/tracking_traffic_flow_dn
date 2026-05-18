@@ -12,12 +12,20 @@ from ultralytics.models import YOLO
 
 from .config import (
     BRANCH_ORDER,
+    CLASS_ASPECT_RATIO_LIMITS,
     CLASS_COLORS,
+    CLASS_CONF_THRESHOLDS,
     CLASS_NAMES,
     CLASS_WEIGHTS,
     DIRECTIONS,
     DISPLAY_CLASS_IDS,
+    EXPECTED_MODEL_NAMES,
     LOST_OUT_FRAMES,
+    MIN_BOX_AREA_RATIO,
+    MIN_BOX_WH,
+    MODEL_CONF,
+    MODEL_IMGSZ,
+    MODEL_IOU,
     VALID_BRANCHES,
 )
 from .flow_logic import (
@@ -25,9 +33,60 @@ from .flow_logic import (
     cleanup_flow_windows,
     create_track_meta,
     emit_branch_event,
+    update_stable_class,
     update_stable_region,
 )
 from .regions import centroid_from_box, draw_region_overlay, get_direction_region
+
+
+def _normalize_model_names(names):
+    if isinstance(names, dict):
+        return {int(k): str(v).lower() for k, v in names.items()}
+    return {idx: str(name).lower() for idx, name in enumerate(names)}
+
+
+def _validate_model_class_mapping(model):
+    """Warn early if the fine-tuned model class order differs from config.py."""
+    model_names = _normalize_model_names(getattr(model, "names", {}))
+    expected = {idx: name.lower() for idx, name in EXPECTED_MODEL_NAMES.items()}
+    mismatches = []
+
+    for idx, expected_name in expected.items():
+        actual_name = model_names.get(idx)
+        if actual_name != expected_name:
+            mismatches.append(f"id {idx}: expected={expected_name}, actual={actual_name}")
+
+    return mismatches
+
+
+def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height):
+    """Class-specific confidence + loose geometry filters for stable detection."""
+    if cls not in CLASS_WEIGHTS:
+        return False
+
+    min_conf = CLASS_CONF_THRESHOLDS.get(cls, 0.25)
+    if conf < min_conf:
+        return False
+
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return False
+
+    min_w, min_h = MIN_BOX_WH.get(cls, (8, 8))
+    if w < min_w or h < min_h:
+        return False
+
+    frame_area = max(frame_width * frame_height, 1)
+    if (w * h) / frame_area < MIN_BOX_AREA_RATIO:
+        return False
+
+    aspect_ratio = w / max(h, 1)
+    min_ratio, max_ratio = CLASS_ASPECT_RATIO_LIMITS.get(cls, (0.15, 8.0))
+    if aspect_ratio < min_ratio or aspect_ratio > max_ratio:
+        return False
+
+    return True
 
 
 def process_video(app, video_path, model_path):
@@ -45,6 +104,13 @@ def process_video(app, video_path, model_path):
             model.to("cuda")
         except Exception:
             model.to("cpu")
+
+        mapping_warnings = _validate_model_class_mapping(model)
+        if mapping_warnings:
+            warning_text = "Class mapping mismatch: " + "; ".join(mapping_warnings)
+            print("[Model Warning]", warning_text)
+            with app.state_lock:
+                app.worker_state["status"] = warning_text
 
         tracker = DeepSort(
             max_age=60,
@@ -130,9 +196,9 @@ def process_video(app, video_path, model_path):
             if frame_id % app.detect_interval == 0:
                 results = model(
                     frame,
-                    imgsz=1280,
-                    conf=0.25,
-                    iou=0.45,
+                    imgsz=MODEL_IMGSZ,
+                    conf=MODEL_CONF,
+                    iou=MODEL_IOU,
                     classes=list(CLASS_WEIGHTS.keys()),
                     verbose=False,
                 )
@@ -141,20 +207,18 @@ def process_video(app, video_path, model_path):
                     for box in result.boxes:
                         cls = int(box.cls[0])
                         conf = float(box.conf[0])
-                        if cls not in CLASS_WEIGHTS:
-                            continue
-
-                        # Motorcycles and bicycles can be small/dense in Vietnam traffic footage.
-                        if cls == 2 and conf < 0.30:
-                            continue
-                        if cls != 2 and conf < 0.15:
-                            continue
-
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        w, h = x2 - x1, y2 - y1
-                        if w <= 0 or h <= 0:
+
+                        frame_h, frame_w = frame.shape[:2]
+                        x1 = max(0, min(x1, frame_w - 1))
+                        y1 = max(0, min(y1, frame_h - 1))
+                        x2 = max(0, min(x2, frame_w - 1))
+                        y2 = max(0, min(y2, frame_h - 1))
+
+                        if not _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_w, frame_h):
                             continue
 
+                        w, h = x2 - x1, y2 - y1
                         detections.append(([x1, y1, w, h], conf, cls))
 
             tracks = tracker.update_tracks(detections, frame=frame)
@@ -209,12 +273,12 @@ def process_video(app, video_path, model_path):
 
                 track_id = track.track_id
                 l, t, r, b = map(int, track.to_ltrb())
-                det_cls = track.det_class
+                det_cls = getattr(track, "det_class", None)
+                det_conf = getattr(track, "det_conf", None)
                 if det_cls is None:
-                    det_cls = track_meta.get(track_id, {}).get("cls", 2)
+                    det_cls = track_meta.get(track_id, {}).get("stable_cls", 2)
 
-                cls = int(det_cls)
-                if cls not in CLASS_WEIGHTS:
+                if int(det_cls) not in CLASS_WEIGHTS:
                     continue
 
                 active_tracks += 1
@@ -227,10 +291,9 @@ def process_video(app, video_path, model_path):
                     app.region_template,
                 )
 
-                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, cls))
+                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
                 meta["last_seen_frame"] = frame_id
-                meta["cls"] = cls
-                meta["weight"] = CLASS_WEIGHTS.get(cls, 1.0)
+                cls = update_stable_class(meta, det_cls, det_conf)
 
                 stable_region = update_stable_region(meta, raw_region)
                 meta["current_region"] = stable_region
@@ -286,7 +349,8 @@ def process_video(app, video_path, model_path):
                 cv2.circle(display_frame, centroid, 3, color, -1)
 
                 print(
-                    f"[DeepSort]   Track={track_id} cls={cls} label={CLASS_NAMES.get(cls, cls)} "
+                    f"[DeepSort]   Track={track_id} stable_cls={cls} raw_cls={det_cls} "
+                    f"conf={det_conf} label={CLASS_NAMES.get(cls, cls)} "
                     f"ltrb=({l},{t},{r},{b}) centroid={centroid} raw={raw_region} "
                     f"stable={stable_region} active_branch={meta.get('active_branch')} "
                     f"confirmed={track.is_confirmed()} time_since_update={track.time_since_update}"
