@@ -149,3 +149,56 @@ CLASS_COLORS = {
     3: (0, 255, 255),    # bus
     4: (0, 165, 255),    # truck
 }
+
+# Performance presets.
+# quality: maximum accuracy, heavier inference.
+# balanced: good default for recorded video.
+# realtime: lower latency; drops visual update work and uses smaller inference size.
+DEFAULT_PERFORMANCE_PROFILE = "balanced"
+PERFORMANCE_PROFILES = {
+    "quality": {
+        "model_imgsz": 1280,
+        "process_width": 0,        # 0 = keep original frame size
+        "detect_interval": 1,
+        "display_every_n": 1,
+        "half_cuda": True,
+        "max_det": 300,
+    },
+    "balanced": {
+        "model_imgsz": 960,
+        "process_width": 1280,
+        "detect_interval": 1,
+        "display_every_n": 2,
+        "half_cuda": True,
+        "max_det": 250,
+    },
+    "realtime": {
+        "model_imgsz": 736,
+        "process_width": 960,
+        "detect_interval": 1,
+        "display_every_n": 3,
+        "half_cuda": True,
+        "max_det": 200,
+    },
+}
+
+# Optional OpenCV CPU threading. 0 means leave OpenCV default unchanged.
+CV2_NUM_THREADS = 0
+
+# Warm up YOLO once before the processing loop so the first visible frames are
+# not slowed by CUDA kernel initialization / autotuning.
+YOLO_WARMUP = True
+
+# Fluid-flow export/replay configuration.
+# ROAD_BRANCHES are real road approaches connected to the center node.
+ROAD_BRANCHES = ("top", "left", "right", "bottom")
+FLUID_REGIONS = ("top", "left", "right", "bottom", "center")
+DEFAULT_EXPORT_ROOT = "flow_exports"
+DEFAULT_FLUID_BIN_SECONDS = 1.0
+DEFAULT_FLUID_SMOOTH_SECONDS = 5.0
+DEFAULT_TRACK_SAMPLE_SECONDS = 0.25
+DEFAULT_REGION_STATE_SAMPLE_SECONDS = 1.0
+DEFAULT_INFER_HIDDEN_LEFT = True
+# If a track appears/disappears in center with x <= width * LEFT_GATE_X_RATIO,
+# treat it as an inferred movement from/to the hidden left branch.
+DEFAULT_LEFT_GATE_X_RATIO = 0.30

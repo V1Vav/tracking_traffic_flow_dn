@@ -6,7 +6,13 @@ from collections import Counter, deque
 from queue import Empty, Full, Queue
 
 import cv2
+import numpy as np
 from PIL import Image
+
+try:
+    import torch
+except Exception:  # pragma: no cover - torch is normally installed with ultralytics
+    torch = None
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics.models import YOLO
 
@@ -17,6 +23,7 @@ from .config import (
     CLASS_CONF_THRESHOLDS,
     CLASS_NAMES,
     CLASS_WEIGHTS,
+    CV2_NUM_THREADS,
     DEBUG_TRACK_LOGS,
     EDGE_LOST_OUT_FRAMES,
     FRAME_EXIT_MARGIN_RATIO,
@@ -25,6 +32,7 @@ from .config import (
     DETECTION_DUPLICATE_IOU,
     DIRECTIONS,
     DISPLAY_CLASS_IDS,
+    DEFAULT_PERFORMANCE_PROFILE,
     EXPECTED_MODEL_NAMES,
     FILE_QUEUE_SECONDS,
     LOST_OUT_FRAMES,
@@ -33,6 +41,7 @@ from .config import (
     MODEL_CONF,
     MODEL_IMGSZ,
     MODEL_IOU,
+    PERFORMANCE_PROFILES,
     REALTIME_QUEUE_SIZE,
     REALTIME_SOURCE_PREFIXES,
     TRACK_COUNT_HOLD_FRAMES,
@@ -46,6 +55,7 @@ from .config import (
     TRACK_NN_BUDGET,
     TRACK_STALE_MERGE_FRAMES,
     VALID_BRANCHES,
+    YOLO_WARMUP,
 )
 from .flow_logic import (
     calc_veh_per_min,
@@ -58,6 +68,7 @@ from .flow_logic import (
     update_stable_region,
 )
 from .regions import centroid_from_box, draw_region_overlay, get_direction_region
+from .fluid_export import FluidFlowExporter
 
 
 def _normalize_model_names(names):
@@ -432,6 +443,149 @@ def _merge_stale_duplicate_meta(track_meta, primary_tracks, frame_id):
             track_meta[track_id]["last_box"] = new_box
 
 
+def _near_hidden_left_gate(centroid, frame_width, app):
+    """Heuristic gate for the hidden/occluded left branch.
+
+    If a track appears or disappears in the center close to this x threshold,
+    the exporter can create an inferred left<->center flow edge. This does not
+    modify the real tracking/counting logic.
+    """
+    if centroid is None or frame_width <= 0:
+        return False
+    try:
+        ratio = float(getattr(app, "left_gate_x_ratio", 0.30))
+    except Exception:
+        ratio = 0.30
+    return float(centroid[0]) <= frame_width * ratio
+
+
+def _fluid_export_enabled(app):
+    try:
+        return bool(app.export_fluid_var.get())
+    except Exception:
+        return False
+
+
+def _get_performance_cfg(app):
+    """Resolve the selected performance preset without changing UI state."""
+    profile = str(getattr(app, "performance_profile", DEFAULT_PERFORMANCE_PROFILE)).strip().lower()
+    if profile not in PERFORMANCE_PROFILES:
+        profile = DEFAULT_PERFORMANCE_PROFILE
+    cfg = PERFORMANCE_PROFILES[profile].copy()
+    app_cfg = getattr(app, "performance_cfg", None)
+    if isinstance(app_cfg, dict):
+        cfg.update(app_cfg)
+    return profile, cfg
+
+
+def _configure_runtime():
+    """Small runtime setup that can improve GPU/CV throughput without changing logic."""
+    if CV2_NUM_THREADS and CV2_NUM_THREADS > 0:
+        try:
+            cv2.setNumThreads(int(CV2_NUM_THREADS))
+        except Exception:
+            pass
+
+    if torch is not None:
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+
+def _select_torch_device():
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                return "cuda:0"
+        except Exception:
+            pass
+    return "cpu"
+
+
+def _resize_for_processing(frame, process_width):
+    """Resize frame before detection/tracking; region templates scale automatically."""
+    try:
+        process_width = int(process_width)
+    except Exception:
+        process_width = 0
+
+    if process_width <= 0:
+        return frame
+
+    h, w = frame.shape[:2]
+    if w <= process_width:
+        return frame
+
+    scale = process_width / float(w)
+    process_height = max(1, int(round(h * scale)))
+    return cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_AREA)
+
+
+def _predict_yolo(model, frame, *, model_imgsz, device, use_half, max_det):
+    """Run YOLO with fast settings, with fallback for older ultralytics versions."""
+    kwargs = {
+        "imgsz": int(model_imgsz),
+        "conf": MODEL_CONF,
+        "iou": MODEL_IOU,
+        "classes": list(CLASS_WEIGHTS.keys()),
+        "verbose": False,
+        "max_det": int(max_det),
+    }
+    if device:
+        kwargs["device"] = device
+    if use_half:
+        kwargs["half"] = True
+
+    try:
+        return model(frame, **kwargs)
+    except TypeError:
+        kwargs.pop("half", None)
+        kwargs.pop("max_det", None)
+        return model(frame, **kwargs)
+    except Exception:
+        if use_half:
+            kwargs.pop("half", None)
+            return model(frame, **kwargs)
+        raise
+
+
+def _warmup_model(model, *, model_imgsz, device, use_half, max_det):
+    if not YOLO_WARMUP:
+        return
+    try:
+        warm_size = max(320, min(int(model_imgsz), 960))
+        dummy = np.zeros((warm_size, warm_size, 3), dtype=np.uint8)
+        _predict_yolo(
+            model,
+            dummy,
+            model_imgsz=model_imgsz,
+            device=device,
+            use_half=use_half,
+            max_det=max_det,
+        )
+    except Exception as exc:
+        print(f"[Perf] YOLO warmup skipped: {exc}")
+
+
+def _export_track_transition(exporter, *, meta, track_id, frame_id, current_time, from_region, to_region, cls, box, centroid, source="observed", confidence=1.0, reason="region_change"):
+    if exporter is None:
+        return False
+    return exporter.log_transition(
+        time_s=current_time,
+        frame_id=frame_id,
+        track_id=track_id,
+        from_region=from_region,
+        to_region=to_region,
+        cls=cls,
+        box=box,
+        centroid=centroid,
+        source=source,
+        confidence=confidence,
+        reason=reason,
+    )
+
+
 def process_video(app, video_path, model_path):
     """
     Process a video/live source in a background thread.
@@ -442,12 +596,28 @@ def process_video(app, video_path, model_path):
     """
     reader_thread = None
     cap = None
+    exporter = None
     try:
+        _configure_runtime()
+        performance_profile, performance_cfg = _get_performance_cfg(app)
+        model_imgsz = int(performance_cfg.get("model_imgsz", MODEL_IMGSZ))
+        process_width = int(performance_cfg.get("process_width", 0))
+        display_every_n = max(1, int(performance_cfg.get("display_every_n", 1)))
+        detect_interval = max(1, int(performance_cfg.get("detect_interval", getattr(app, "detect_interval", 1))))
+        max_det = max(1, int(performance_cfg.get("max_det", 300)))
+
+        device = _select_torch_device()
+        use_half = bool(performance_cfg.get("half_cuda", True)) and str(device).startswith("cuda")
+
         model = YOLO(model_path)
         try:
-            model.to("cuda")
+            model.to(device)
         except Exception:
+            device = "cpu"
+            use_half = False
             model.to("cpu")
+
+        _warmup_model(model, model_imgsz=model_imgsz, device=device, use_half=use_half, max_det=max_det)
 
         mapping_warnings = _validate_model_class_mapping(model)
         if mapping_warnings:
@@ -504,7 +674,10 @@ def process_video(app, video_path, model_path):
 
         with app.state_lock:
             source_mode = "live" if realtime_source else "file"
-            app.worker_state["status"] = f"{source_mode.title()} source ready @ {fps_input:.1f} FPS"
+            app.worker_state["status"] = (
+                f"{source_mode.title()} source ready @ {fps_input:.1f} FPS | "
+                f"perf={performance_profile}, device={device}, imgsz={model_imgsz}, width={process_width or 'native'}"
+            )
 
         if app.region_template and app.region_template.loaded:
             # Center is always a valid row in the UI. If template.csv has an
@@ -527,6 +700,23 @@ def process_video(app, video_path, model_path):
             for direction in DIRECTIONS
         }
 
+        if _fluid_export_enabled(app):
+            exporter = FluidFlowExporter(
+                root_dir=app.export_root_var.get().strip() or "flow_exports",
+                source_path=video_path,
+                model_path=model_path,
+                fps=fps_input,
+                valid_regions=valid_branches,
+                template_path=app.template_mapping_path_var.get().strip(),
+                bin_seconds=getattr(app, "fluid_bin_seconds", 1.0),
+                smooth_seconds=getattr(app, "fluid_smooth_seconds", 5.0),
+                track_sample_seconds=getattr(app, "track_sample_seconds", 0.25),
+                region_state_sample_seconds=getattr(app, "region_state_sample_seconds", 1.0),
+                hidden_left_enabled=bool(app.infer_hidden_left_var.get()),
+            )
+            with app.state_lock:
+                app.worker_state["status"] = f"Exporting flow to {exporter.output_dir}"
+
         track_meta = {}
         prev_time = time.time()
         playback_start = time.time()
@@ -543,17 +733,19 @@ def process_video(app, video_path, model_path):
 
             frame_id += 1
             current_time = time.time() - processing_start if realtime_source else frame_id / fps_input
-            display_frame = frame.copy()
+            frame = _resize_for_processing(frame, process_width)
+            should_update_display = (frame_id % display_every_n == 0)
+            display_frame = frame.copy() if should_update_display else None
 
             detections = []
-            if frame_id % app.detect_interval == 0:
-                results = model(
+            if frame_id % detect_interval == 0:
+                results = _predict_yolo(
+                    model,
                     frame,
-                    imgsz=MODEL_IMGSZ,
-                    conf=MODEL_CONF,
-                    iou=MODEL_IOU,
-                    classes=list(CLASS_WEIGHTS.keys()),
-                    verbose=False,
+                    model_imgsz=model_imgsz,
+                    device=device,
+                    use_half=use_half,
+                    max_det=max_det,
                 )
 
                 frame_h, frame_w = frame.shape[:2]
@@ -623,6 +815,31 @@ def process_video(app, video_path, model_path):
                 if missing_frames < lost_limit:
                     continue
 
+                last_centroid = meta.get("last_centroid")
+                if (
+                    exporter is not None
+                    and bool(app.infer_hidden_left_var.get())
+                    and meta.get("last_fluid_region") == "center"
+                    and _near_hidden_left_gate(last_centroid, frame_w, app)
+                    and not meta.get("fluid_closed_to_left", False)
+                ):
+                    _export_track_transition(
+                        exporter,
+                        meta=meta,
+                        track_id=track_id,
+                        frame_id=frame_id,
+                        current_time=current_time,
+                        from_region="center",
+                        to_region="left",
+                        cls=meta.get("active_branch_cls", meta.get("stable_cls", meta.get("cls", 2))),
+                        box=meta.get("last_box"),
+                        centroid=last_centroid,
+                        source="inferred",
+                        confidence=0.70,
+                        reason="lost_near_left_gate",
+                    )
+                    meta["fluid_closed_to_left"] = True
+
                 emitted = _emit_active_branch_out(
                     meta,
                     track_id,
@@ -670,6 +887,67 @@ def process_video(app, video_path, model_path):
 
                 stable_region = update_stable_region(meta, raw_region)
                 meta["current_region"] = stable_region
+                meta["last_centroid"] = centroid
+
+                if exporter is not None:
+                    exporter.log_track_sample(
+                        time_s=current_time,
+                        frame_id=frame_id,
+                        track_id=track_id,
+                        cls=cls,
+                        raw_region=raw_region,
+                        stable_region=stable_region,
+                        active_branch=meta.get("active_branch"),
+                        box=(l, t, r, b),
+                        source="observed",
+                    )
+
+                    if stable_region in valid_branches:
+                        previous_fluid_region = meta.get("last_fluid_region")
+                        if previous_fluid_region is None:
+                            # First stable region for this track. If it appears
+                            # in center close to the hidden-left gate, create an
+                            # inferred left->center input edge for fluid replay.
+                            if (
+                                bool(app.infer_hidden_left_var.get())
+                                and stable_region == "center"
+                                and _near_hidden_left_gate(centroid, frame.shape[1], app)
+                                and not meta.get("fluid_started_from_left", False)
+                            ):
+                                _export_track_transition(
+                                    exporter,
+                                    meta=meta,
+                                    track_id=track_id,
+                                    frame_id=frame_id,
+                                    current_time=current_time,
+                                    from_region="left",
+                                    to_region="center",
+                                    cls=cls,
+                                    box=(l, t, r, b),
+                                    centroid=centroid,
+                                    source="inferred",
+                                    confidence=0.70,
+                                    reason="first_seen_center_near_left_gate",
+                                )
+                                meta["fluid_started_from_left"] = True
+                            meta["last_fluid_region"] = stable_region
+                        elif previous_fluid_region != stable_region:
+                            _export_track_transition(
+                                exporter,
+                                meta=meta,
+                                track_id=track_id,
+                                frame_id=frame_id,
+                                current_time=current_time,
+                                from_region=previous_fluid_region,
+                                to_region=stable_region,
+                                cls=cls,
+                                box=(l, t, r, b),
+                                centroid=centroid,
+                                source="observed",
+                                confidence=1.0,
+                                reason="stable_region_change",
+                            )
+                            meta["last_fluid_region"] = stable_region
 
                 if stable_region is not None:
                     current_is_branch = stable_region in valid_branches
@@ -710,16 +988,17 @@ def process_video(app, video_path, model_path):
                             print(f"[Flow] IN: branch={stable_region} cls={event_cls} track_id={track_id}")
                         mark_branch_enter(meta, stable_region, counted=emitted, event_cls=event_cls)
 
-                color = CLASS_COLORS.get(cls, (255, 255, 255))
+                if should_update_display and display_frame is not None:
+                    color = CLASS_COLORS.get(cls, (255, 255, 255))
 
-                label = f"{CLASS_NAMES.get(cls, cls)} #{track_id}"
-                region_label = stable_region if stable_region is not None else raw_region
-                if region_label:
-                    label += f" {region_label}"
+                    label = f"{CLASS_NAMES.get(cls, cls)} #{track_id}"
+                    region_label = stable_region if stable_region is not None else raw_region
+                    if region_label:
+                        label += f" {region_label}"
 
-                cv2.rectangle(display_frame, (l, t), (r, b), color, 2)
-                cv2.putText(display_frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                cv2.circle(display_frame, centroid, 3, color, -1)
+                    cv2.rectangle(display_frame, (l, t), (r, b), color, 2)
+                    cv2.putText(display_frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.circle(display_frame, centroid, 3, color, -1)
 
                 if DEBUG_TRACK_LOGS:
                     print(
@@ -730,7 +1009,7 @@ def process_video(app, video_path, model_path):
                         f"confirmed={track.is_confirmed()} time_since_update={track.time_since_update}"
                     )
 
-            if app.display_template_var.get():
+            if should_update_display and display_frame is not None and app.display_template_var.get():
                 draw_region_overlay(display_frame, app.region_margin, app.region_template)
 
             cleanup_flow_windows(branch_event_windows, current_time, app.flow_window)
@@ -747,13 +1026,23 @@ def process_video(app, video_path, model_path):
                     branch_current_pce[region] += meta.get("weight", 0.0)
                     branch_current_count[region] += 1
 
+            if exporter is not None:
+                exporter.write_region_state_snapshot(
+                    time_s=current_time,
+                    frame_id=frame_id,
+                    region_current_count=branch_current_count,
+                    region_current_pce=branch_current_pce,
+                )
+
             curr_time = time.time()
             fps = 1.0 / (curr_time - prev_time) if curr_time > prev_time else 0.0
             prev_time = curr_time
 
-            rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(rgb_frame)
-            pil_image = pil_image.resize((880, 620), Image.LANCZOS)
+            pil_image = None
+            if should_update_display and display_frame is not None:
+                rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(rgb_frame)
+                pil_image = pil_image.resize((880, 620), Image.LANCZOS)
 
             total_current_pce = 0.0
             total_in_count = 0
@@ -798,9 +1087,15 @@ def process_video(app, video_path, model_path):
                     # one vehicle again when it passes through the intersection.
                     total_in_count += branch_count_total[(branch, "in")]
 
+            realtime_ratio = fps / fps_input if fps_input > 0 else 0.0
             with app.state_lock:
-                app.latest_pil_image = pil_image
-                app.worker_state["status"] = "Running (live)" if realtime_source else "Running"
+                if pil_image is not None:
+                    app.latest_pil_image = pil_image
+                source_label = "live" if realtime_source else "file"
+                app.worker_state["status"] = (
+                    f"Running ({source_label}, {performance_profile}, {device}, "
+                    f"{realtime_ratio:.2f}x realtime)"
+                )
                 app.worker_state["frame"] = str(frame_id)
                 app.worker_state["fps"] = f"{fps:.1f}"
                 app.worker_state["active_tracks"] = str(active_tracks)
@@ -868,8 +1163,20 @@ def process_video(app, video_path, model_path):
                 app.worker_state["flow_veh_pm"] = str(total_in_count)
                 app.worker_state.update(final_updates)
 
+        if exporter is not None:
+            exporter.write_region_state_snapshot(
+                time_s=(frame_id / fps_input if (not realtime_source and fps_input > 0) else current_time),
+                frame_id=frame_id,
+                region_current_count={branch: 0 for branch in valid_branches},
+                region_current_pce={branch: 0.0 for branch in valid_branches},
+                force=True,
+            )
+
         with app.state_lock:
-            app.worker_state["status"] = "Stopped" if app.stop_event.is_set() else "Finished"
+            if exporter is not None:
+                app.worker_state["status"] = ("Stopped" if app.stop_event.is_set() else "Finished") + f" | export: {exporter.output_dir}"
+            else:
+                app.worker_state["status"] = "Stopped" if app.stop_event.is_set() else "Finished"
 
     except Exception as exc:
         with app.state_lock:
@@ -880,5 +1187,10 @@ def process_video(app, video_path, model_path):
                 reader_thread.join(timeout=1.0)
             except Exception:
                 pass
+        if exporter is not None:
+            try:
+                exporter.close()
+            except Exception as export_exc:
+                print(f"[FluidExport] Error while closing exporter: {export_exc}")
         if cap is not None and cap.isOpened():
             cap.release()
