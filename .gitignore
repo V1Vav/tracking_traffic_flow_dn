@@ -5,6 +5,8 @@ data_dn/
 ouput_video/
 temp/
 */backup/
+flow_exports/
+docs/
 
 # Python artifacts
 __pycache__/

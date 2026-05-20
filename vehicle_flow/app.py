@@ -11,8 +11,17 @@ from .config import (
     BRANCH_ORDER,
     CLASS_NAMES,
     DEFAULT_AVAILABLE_MODELS,
+    DEFAULT_EXPORT_ROOT,
+    DEFAULT_FLUID_BIN_SECONDS,
+    DEFAULT_FLUID_SMOOTH_SECONDS,
+    DEFAULT_INFER_HIDDEN_LEFT,
+    DEFAULT_LEFT_GATE_X_RATIO,
     DEFAULT_MODEL_PATH,
+    DEFAULT_PERFORMANCE_PROFILE,
+    PERFORMANCE_PROFILES,
+    DEFAULT_REGION_STATE_SAMPLE_SECONDS,
     DEFAULT_TEMPLATE_MAPPING,
+    DEFAULT_TRACK_SAMPLE_SECONDS,
     DISPLAY_CLASS_IDS,
 )
 from .regions import RegionTemplate
@@ -31,9 +40,22 @@ class FlowApp:
         self.template_mapping_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_MAPPING)
         self.status_var = tk.StringVar(value="Ready")
         self.available_models = DEFAULT_AVAILABLE_MODELS
+        self.performance_profile_var = tk.StringVar(value=DEFAULT_PERFORMANCE_PROFILE)
 
         self.region_template = None
         self.display_template_var = tk.BooleanVar(value=False)
+
+        # Fluid-flow export options. These are intentionally kept simple so
+        # this branch can export replay data without changing the existing
+        # tracking/counting UI semantics.
+        self.export_fluid_var = tk.BooleanVar(value=False)
+        self.infer_hidden_left_var = tk.BooleanVar(value=DEFAULT_INFER_HIDDEN_LEFT)
+        self.export_root_var = tk.StringVar(value=DEFAULT_EXPORT_ROOT)
+        self.fluid_bin_seconds_var = tk.StringVar(value=str(DEFAULT_FLUID_BIN_SECONDS))
+        self.fluid_smooth_seconds_var = tk.StringVar(value=str(DEFAULT_FLUID_SMOOTH_SECONDS))
+        self.track_sample_seconds_var = tk.StringVar(value=str(DEFAULT_TRACK_SAMPLE_SECONDS))
+        self.region_state_sample_seconds_var = tk.StringVar(value=str(DEFAULT_REGION_STATE_SAMPLE_SECONDS))
+        self.left_gate_x_ratio_var = tk.StringVar(value=str(DEFAULT_LEFT_GATE_X_RATIO))
 
         self.worker_state = self._default_worker_state()
         self.metrics = {
@@ -121,13 +143,29 @@ class FlowApp:
             control_frame,
             text="Display Region Template",
             variable=self.display_template_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=4)
+        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=2)
+
+        ttk.Checkbutton(
+            control_frame,
+            text="Export Flow Data",
+            variable=self.export_fluid_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=2)
+
+        ttk.Label(control_frame, text="Performance:").grid(row=8, column=0, sticky="w", pady=2)
+        ttk.Combobox(
+            control_frame,
+            textvariable=self.performance_profile_var,
+            values=list(PERFORMANCE_PROFILES.keys()),
+            width=12,
+            state="readonly",
+        ).grid(row=8, column=1, sticky="ew", pady=2)
 
         self.start_button = ttk.Button(control_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=7, column=0, columnspan=2, pady=8, sticky="ew")
+        self.start_button.grid(row=9, column=0, columnspan=2, pady=(6, 2), sticky="ew")
         self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.grid(row=8, column=0, columnspan=2, sticky="ew")
+        self.stop_button.grid(row=10, column=0, columnspan=2, sticky="ew")
 
+        control_frame.grid_columnconfigure(0, weight=1)
         for child in control_frame.winfo_children():
             child.grid_configure(padx=2, pady=2)
 
@@ -211,6 +249,34 @@ class FlowApp:
         self.region_template = None
         self.status_var.set("Template unavailable; using margin regions")
 
+    def _float_from_var(self, var, default, min_value=None, max_value=None):
+        try:
+            value = float(var.get())
+        except Exception:
+            value = float(default)
+        if min_value is not None:
+            value = max(value, float(min_value))
+        if max_value is not None:
+            value = min(value, float(max_value))
+        var.set(str(value))
+        return value
+
+    def _normalize_export_settings(self):
+        self.fluid_bin_seconds = self._float_from_var(self.fluid_bin_seconds_var, DEFAULT_FLUID_BIN_SECONDS, 0.1, 60.0)
+        self.fluid_smooth_seconds = self._float_from_var(self.fluid_smooth_seconds_var, DEFAULT_FLUID_SMOOTH_SECONDS, 0.0, 300.0)
+        self.track_sample_seconds = self._float_from_var(self.track_sample_seconds_var, DEFAULT_TRACK_SAMPLE_SECONDS, 0.0, 60.0)
+        self.region_state_sample_seconds = self._float_from_var(self.region_state_sample_seconds_var, DEFAULT_REGION_STATE_SAMPLE_SECONDS, 0.1, 60.0)
+        self.left_gate_x_ratio = self._float_from_var(self.left_gate_x_ratio_var, DEFAULT_LEFT_GATE_X_RATIO, 0.01, 0.95)
+
+    def _normalize_performance_settings(self):
+        profile = self.performance_profile_var.get().strip().lower()
+        if profile not in PERFORMANCE_PROFILES:
+            profile = DEFAULT_PERFORMANCE_PROFILE
+        self.performance_profile = profile
+        self.performance_cfg = PERFORMANCE_PROFILES[profile].copy()
+        self.detect_interval = int(self.performance_cfg.get("detect_interval", self.detect_interval))
+        self.performance_profile_var.set(profile)
+
     def start_processing(self):
         if self.processing_thread and self.processing_thread.is_alive():
             return
@@ -232,6 +298,9 @@ class FlowApp:
         with self.state_lock:
             self.worker_state = self._default_worker_state()
             self.worker_state["status"] = "Loading model..."
+
+        self._normalize_export_settings()
+        self._normalize_performance_settings()
 
         self.stop_event.clear()
         self.processing_thread = threading.Thread(
