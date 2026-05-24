@@ -7,6 +7,7 @@ from .config import (
     CLASS_LOCK_MIN_FRAMES,
     CLASS_STABILITY_RATIO,
     CLASS_WEIGHTS,
+    COUNTED_CLASS_IDS,
     EVENT_COOLDOWN_FRAMES,
     MIN_CLASS_VOTES,
     CLASS_SWITCH_MIN_VOTES,
@@ -28,7 +29,7 @@ def create_track_meta(frame_id, cls):
         "current_region": None,
         "last_box": None,
         "duplicate_of": None,
-        "weight": CLASS_WEIGHTS.get(cls, 1.0),
+        "weight": CLASS_WEIGHTS.get(cls, 0.0),
         "cls": cls,
         "stable_cls": cls,
         "stable_cls_age": 0,
@@ -49,7 +50,7 @@ def update_stable_class(meta, det_cls, det_conf=None):
     if det_cls is None:
         meta["stable_cls_age"] = meta.get("stable_cls_age", 0) + 1
         meta["cls"] = stable_cls
-        meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 1.0)
+        meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 0.0)
         return stable_cls
 
     det_cls = int(det_cls)
@@ -59,7 +60,7 @@ def update_stable_class(meta, det_cls, det_conf=None):
     if len(meta["class_history"]) < MIN_CLASS_VOTES:
         meta["stable_cls_age"] = meta.get("stable_cls_age", 0) + 1
         meta["cls"] = stable_cls
-        meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 1.0)
+        meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 0.0)
         return stable_cls
 
     weighted_votes = Counter()
@@ -95,7 +96,7 @@ def update_stable_class(meta, det_cls, det_conf=None):
     meta["stable_cls"] = stable_cls
     meta["stable_cls_age"] = stable_age + 1
     meta["cls"] = stable_cls
-    meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 1.0)
+    meta["weight"] = CLASS_WEIGHTS.get(stable_cls, 0.0)
     return stable_cls
 
 
@@ -188,6 +189,8 @@ def emit_branch_event(
 
     cls = event_cls if event_cls is not None else meta.get("stable_cls", meta.get("cls", 2))
     cls = int(cls)
+    if cls not in COUNTED_CLASS_IDS:
+        return False
     branch_count_total[(branch, direction)] += 1
     branch_class_count_total[(branch, direction, cls)] += 1
     add_flow_event(branch_event_windows, branch, direction, current_time, frame_id, track_id, cls)

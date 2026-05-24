@@ -26,7 +26,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
-from .config import CLASS_NAMES, CLASS_WEIGHTS, FLUID_REGIONS, ROAD_BRANCHES
+from .config import CLASS_NAMES, CLASS_WEIGHTS, COUNTED_CLASS_IDS, FLUID_REGIONS, ROAD_BRANCHES, REGION_TO_APPROACH, INBOUND_LANE_REGIONS
 
 UNKNOWN_REGION = "unknown"
 
@@ -212,7 +212,7 @@ class FluidFlowExporter:
         ]
 
     def _edge_header(self):
-        class_ids = sorted(CLASS_NAMES.keys())
+        class_ids = sorted(COUNTED_CLASS_IDS)
         header = [
             "time_s", "dt_s", "from_region", "to_region", "edge",
             "vehicle_count", "pce_sum",
@@ -291,6 +291,8 @@ class FluidFlowExporter:
             "region_state_sample_seconds": self.region_state_sample_seconds,
             "hidden_left_inference_enabled": self.hidden_left_enabled,
             "class_names": CLASS_NAMES,
+            "counted_class_ids": list(COUNTED_CLASS_IDS),
+            "ignored_class_ids": [cls_id for cls_id in CLASS_NAMES.keys() if cls_id not in COUNTED_CLASS_IDS],
             "class_weights_pce": CLASS_WEIGHTS,
             "files": files,
             "concept": {
@@ -298,7 +300,7 @@ class FluidFlowExporter:
                 "flow_edges_real": "Raw edge events with real timestamps. Preferred for replay/RL; no binning, smoothing, or interpolation is applied during export.",
                 "flow_edges_timeseries": "Backward-compatible binned pipe flow between regions. Quick to inspect, but less faithful than flow_edges_real.csv.",
                 "region_state_timeseries": "Observed mass inside each region. Use as occupancy/queue proxy.",
-                "od_routes": "Origin-destination route events inferred from branch->center then center->branch transitions.",
+                "od_routes": "Origin-destination route events inferred from inbound-lane->center then center->outbound-lane transitions.",
                 "rl_demand_timeseries": "Aggregated OD demand by time bin. Use this as input demand for an RL traffic environment.",
                 "rl_state_timeseries": "State-like observation table with queues/demand/served/throughput. action_phase is -1 because the source video has no controller action label.",
             },
@@ -326,7 +328,7 @@ class FluidFlowExporter:
             "track_id": track_id,
             "class_id": cls,
             "class_name": CLASS_NAMES.get(cls, str(cls)),
-            "pce": f"{CLASS_WEIGHTS.get(cls, 1.0):.3f}",
+            "pce": f"{CLASS_WEIGHTS.get(cls, 0.0):.3f}",
             "raw_region": raw_region or "",
             "stable_region": stable_region or "",
             "active_branch": active_branch or "",
@@ -463,7 +465,9 @@ class FluidFlowExporter:
             return False
 
         cls = int(cls)
-        pce = float(CLASS_WEIGHTS.get(cls, 1.0))
+        if cls not in COUNTED_CLASS_IDS:
+            return False
+        pce = float(CLASS_WEIGHTS.get(cls, 0.0))
         self._transition_seq += 1
         x1, y1, x2, y2, box_cx, box_cy = _box_fields(box)
         cx, cy = _centroid_fields(centroid)
@@ -582,7 +586,7 @@ class FluidFlowExporter:
         return max_time
 
     def write_edge_timeseries(self):
-        class_ids = sorted(CLASS_NAMES.keys())
+        class_ids = sorted(COUNTED_CLASS_IDS)
         bin_s = self.bin_seconds
         max_time = self._time_range()
         n_bins = int(math.floor(max_time / bin_s)) + 1
@@ -783,6 +787,8 @@ class FluidFlowExporter:
                 throughput = 0.0
                 ns_demand = 0.0
                 ew_demand = 0.0
+                ns_queue = 0.0
+                ew_queue = 0.0
 
                 for branch in ROAD_BRANCHES:
                     state = snapshot.get(branch, {})
@@ -798,18 +804,25 @@ class FluidFlowExporter:
                     row[f"exit_to_{branch}_pce"] = f"{exit_to:.3f}"
                     total_queue += q_pce
                     throughput += served
-                    if branch in ("top", "bottom"):
-                        ns_demand += demand
-                    elif branch in ("left", "right"):
-                        ew_demand += demand
+                    approach = REGION_TO_APPROACH.get(branch, "")
+                    if approach in ("top", "bottom"):
+                        ns_queue += q_pce
+                    elif approach in ("left", "right"):
+                        ew_queue += q_pce
+                    # Demand for controller input is counted from inbound lanes only.
+                    if branch in INBOUND_LANE_REGIONS:
+                        if approach in ("top", "bottom"):
+                            ns_demand += demand
+                        elif approach in ("left", "right"):
+                            ew_demand += demand
 
                 center_state = snapshot.get("center", {})
                 center_q = float(center_state.get("queue_estimate_pce", 0.0))
                 center_veh = float(center_state.get("vehicle_count_now", 0.0))
                 row["queue_center_pce"] = f"{center_q:.3f}"
                 row["queue_center_veh"] = f"{center_veh:.3f}"
-                row["ns_queue_pce"] = f"{float(row['queue_top_pce']) + float(row['queue_bottom_pce']):.3f}"
-                row["ew_queue_pce"] = f"{float(row['queue_left_pce']) + float(row['queue_right_pce']):.3f}"
+                row["ns_queue_pce"] = f"{ns_queue:.3f}"
+                row["ew_queue_pce"] = f"{ew_queue:.3f}"
                 row["ns_demand_pce"] = f"{ns_demand:.3f}"
                 row["ew_demand_pce"] = f"{ew_demand:.3f}"
                 row["total_queue_pce"] = f"{total_queue + center_q:.3f}"

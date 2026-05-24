@@ -7,6 +7,8 @@ temp/
 */backup/
 flow_exports/
 docs/
+images/
+tuning/
 
 # Python artifacts
 __pycache__/

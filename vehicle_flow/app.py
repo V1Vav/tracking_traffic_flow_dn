@@ -23,17 +23,39 @@ from .config import (
     DEFAULT_TEMPLATE_MAPPING,
     DEFAULT_TRACK_SAMPLE_SECONDS,
     DISPLAY_CLASS_IDS,
+    REGION_DISPLAY_NAMES,
 )
 from .regions import RegionTemplate
 from .video_worker import process_video
 
 
+UI = {
+    "bg": "#f1f5f9",
+    "card": "#ffffff",
+    "card_2": "#f8fafc",
+    "border": "#cbd5e1",
+    "border_soft": "#e2e8f0",
+    "text": "#0f172a",
+    "muted": "#64748b",
+    "accent": "#2563eb",
+    "accent_dark": "#1d4ed8",
+    "success": "#16a34a",
+    "danger": "#dc2626",
+    "video_bg": "#020617",
+    "video_text": "#94a3b8",
+}
+
+
 class FlowApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Vehicle Flow Explorer")
-        self.root.geometry("1280x780")
+        self.root.title("Vehicle Flow Explorer · AI Traffic Analytics")
+        self.root.geometry("1360x820")
+        self.root.minsize(1120, 720)
+        self.root.configure(bg=UI["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self._setup_style()
 
         self.video_path_var = tk.StringVar(value="")
         self.model_path_var = tk.StringVar(value=DEFAULT_MODEL_PATH)
@@ -43,11 +65,10 @@ class FlowApp:
         self.performance_profile_var = tk.StringVar(value=DEFAULT_PERFORMANCE_PROFILE)
 
         self.region_template = None
-        self.display_template_var = tk.BooleanVar(value=False)
+        self.display_template_var = tk.BooleanVar(value=True)
 
-        # Fluid-flow export options. These are intentionally kept simple so
-        # this branch can export replay data without changing the existing
-        # tracking/counting UI semantics.
+        # Fluid-flow export options. Keep the UI compact: only the checkbox is
+        # exposed in the main screen. Advanced values still have safe defaults.
         self.export_fluid_var = tk.BooleanVar(value=False)
         self.infer_hidden_left_var = tk.BooleanVar(value=DEFAULT_INFER_HIDDEN_LEFT)
         self.export_root_var = tk.StringVar(value=DEFAULT_EXPORT_ROOT)
@@ -78,6 +99,56 @@ class FlowApp:
         self.load_region_template()
         self.root.after(50, self._update_ui)
 
+    def _setup_style(self):
+        self.root.option_add("*Font", ("Segoe UI", 10))
+        self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", font=("Segoe UI", 10), background=UI["bg"], foreground=UI["text"])
+        style.configure("App.TFrame", background=UI["bg"])
+        style.configure("Card.TFrame", background=UI["card"], relief="flat")
+        style.configure("Subtle.TFrame", background=UI["card_2"], relief="flat")
+        style.configure("Header.TFrame", background=UI["bg"])
+
+        style.configure("TLabel", background=UI["bg"], foreground=UI["text"])
+        style.configure("Card.TLabel", background=UI["card"], foreground=UI["text"])
+        style.configure("Muted.TLabel", background=UI["card"], foreground=UI["muted"])
+        style.configure("Title.TLabel", background=UI["bg"], foreground=UI["text"], font=("Segoe UI", 18, "bold"))
+        style.configure("Subtitle.TLabel", background=UI["bg"], foreground=UI["muted"], font=("Segoe UI", 10))
+        style.configure("Section.TLabel", background=UI["card"], foreground=UI["text"], font=("Segoe UI", 11, "bold"))
+        style.configure("MetricValue.TLabel", background=UI["card_2"], foreground=UI["accent_dark"], font=("Segoe UI", 13, "bold"))
+        style.configure("MetricName.TLabel", background=UI["card_2"], foreground=UI["muted"], font=("Segoe UI", 8, "bold"))
+        style.configure("MetricCompactName.TLabel", background=UI["card"], foreground=UI["muted"], font=("Segoe UI", 8, "bold"))
+        style.configure("MetricCompactValue.TLabel", background=UI["card"], foreground=UI["accent_dark"], font=("Segoe UI", 10, "bold"))
+        style.configure("TableHeader.TLabel", background="#e0ecff", foreground=UI["accent_dark"], font=("Segoe UI", 8, "bold"))
+        style.configure("TableCell.TLabel", background=UI["card"], foreground=UI["text"], font=("Segoe UI", 9))
+        style.configure("TableValue.TLabel", background=UI["card"], foreground=UI["text"], font=("Segoe UI", 9, "bold"))
+        style.configure("Status.TLabel", background=UI["card_2"], foreground=UI["muted"], font=("Segoe UI", 9))
+        style.configure("StatusValue.TLabel", background=UI["card_2"], foreground=UI["text"], font=("Segoe UI", 9, "bold"))
+
+        style.configure("TLabelframe", background=UI["card"], foreground=UI["text"], bordercolor=UI["border_soft"], relief="solid")
+        style.configure("TLabelframe.Label", background=UI["card"], foreground=UI["text"], font=("Segoe UI", 10, "bold"))
+        style.configure("TCheckbutton", background=UI["card"], foreground=UI["text"])
+        style.map("TCheckbutton", background=[("active", UI["card"])] )
+
+        style.configure("TEntry", fieldbackground="#ffffff", foreground=UI["text"], bordercolor=UI["border"])
+        style.configure("TCombobox", fieldbackground="#ffffff", foreground=UI["text"], bordercolor=UI["border"])
+        style.configure("TNotebook", background=UI["card"], borderwidth=0, tabmargins=(0, 2, 0, 0))
+        style.configure("TNotebook.Tab", background=UI["card_2"], foreground=UI["muted"], padding=(10, 5), font=("Segoe UI", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#e0ecff"), ("active", "#f1f5f9")], foreground=[("selected", UI["accent_dark"])])
+
+        style.configure("Accent.TButton", background=UI["success"], foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0, padding=(8, 6))
+        style.map("Accent.TButton", background=[("active", "#15803d"), ("disabled", "#94a3b8")])
+        style.configure("Danger.TButton", background=UI["danger"], foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0, padding=(8, 6))
+        style.map("Danger.TButton", background=[("active", "#b91c1c"), ("disabled", "#94a3b8")])
+        style.configure("Tool.TButton", background="#e2e8f0", foreground=UI["text"], borderwidth=0, padding=(8, 5))
+        style.map("Tool.TButton", background=[("active", "#cbd5e1")])
+
     def _default_worker_state(self):
         state = {
             "status": "Ready",
@@ -104,114 +175,206 @@ class FlowApp:
 
         return state
 
+    def _metric_card(self, parent, row, col, title, var_name):
+        card = ttk.Frame(parent, style="Subtle.TFrame", padding=(8, 5))
+        card.grid(row=row, column=col, sticky="nsew", padx=3, pady=3)
+        ttk.Label(card, text=title.upper(), style="MetricName.TLabel").pack(anchor="w")
+        ttk.Label(card, textvariable=self.metrics[var_name], style="MetricValue.TLabel").pack(anchor="w")
+        return card
+
+    def _compact_metric(self, parent, row, col, title, var_name):
+        cell = ttk.Frame(parent, style="Card.TFrame")
+        cell.grid(row=row, column=col, sticky="ew", padx=(0, 8), pady=1)
+        cell.grid_columnconfigure(1, weight=1)
+        ttk.Label(cell, text=f"{title}:", style="MetricCompactName.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 4))
+        ttk.Label(cell, textvariable=self.metrics[var_name], style="MetricCompactValue.TLabel").grid(row=0, column=1, sticky="w")
+        return cell
+
+    def _table_label(self, parent, text=None, variable=None, style="TableCell.TLabel", anchor="center"):
+        label = ttk.Label(parent, text=text, textvariable=variable, style=style, anchor=anchor)
+        return label
+
+    def _vehicle_header_name(self, class_name, direction):
+        short_names = {
+            "bicycle": "Bicycle",
+            "bus": "Bus",
+            "car": "Car",
+            "motorbike": "Motorbike",
+            "motorcycle": "Moto",
+        }
+        return f"{short_names.get(class_name, class_name.title())} {direction}"
+
     def _build_ui(self):
-        left_frame = ttk.Frame(self.root)
-        right_frame = ttk.Frame(self.root, width=340)
-
-        left_frame.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
-        right_frame.grid(row=0, column=1, sticky="ns", padx=6, pady=6)
-
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=10)
+        shell.grid(row=0, column=0, sticky="nsew")
         self.root.grid_columnconfigure(0, weight=1)
-        self.root.grid_columnconfigure(1, weight=0)
         self.root.grid_rowconfigure(0, weight=1)
 
-        self.video_label = ttk.Label(left_frame, anchor="center")
-        self.video_label.pack(fill="both", expand=True)
+        header = ttk.Frame(shell, style="Header.TFrame")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        header.grid_columnconfigure(0, weight=1)
+        ttk.Label(header, text="Vehicle Flow Explorer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="YOLO + DeepSORT traffic counting, 8-lane region analysis, and fluid-flow export",
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        control_frame = ttk.LabelFrame(right_frame, text="Controls")
-        control_frame.pack(fill="x", pady=(0, 8))
+        content = ttk.Frame(shell, style="App.TFrame")
+        content.grid(row=1, column=0, sticky="nsew")
+        shell.grid_columnconfigure(0, weight=1)
+        shell.grid_rowconfigure(1, weight=1)
 
-        ttk.Label(control_frame, text="Video / Camera / Stream:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(control_frame, textvariable=self.video_path_var, width=36).grid(row=1, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(control_frame, text="Browse...", command=self.browse_video).grid(row=1, column=1, sticky="ew")
+        left_frame = ttk.Frame(content, style="App.TFrame")
+        right_frame = ttk.Frame(content, style="Card.TFrame", padding=8, width=390)
 
-        ttk.Label(control_frame, text="Model:").grid(row=2, column=0, sticky="w", pady=4)
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        right_frame.grid(row=0, column=1, sticky="ns")
+        right_frame.grid_propagate(False)
+
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=0)
+        content.grid_rowconfigure(0, weight=1)
+
+        video_card = ttk.Frame(left_frame, style="Card.TFrame", padding=10)
+        video_card.pack(fill="both", expand=True)
+        video_card.grid_columnconfigure(0, weight=1)
+        video_card.grid_rowconfigure(1, weight=1)
+
+        video_header = ttk.Frame(video_card, style="Card.TFrame")
+        video_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        video_header.grid_columnconfigure(0, weight=1)
+        ttk.Label(video_header, text="Live Preview", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(video_header, text="Regions are highlighted when Show Regions is enabled", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+
+        self.video_label = tk.Label(
+            video_card,
+            text="Select a video, camera index, or stream URL\nthen press Start",
+            anchor="center",
+            justify="center",
+            bg=UI["video_bg"],
+            fg=UI["video_text"],
+            font=("Segoe UI", 14, "bold"),
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=UI["border"],
+        )
+        self.video_label.grid(row=1, column=0, sticky="nsew")
+
+        # ---------- Controls ----------
+        control_frame = ttk.LabelFrame(right_frame, text="  Controls  ", padding=8)
+        control_frame.pack(fill="x", pady=(0, 6))
+        control_frame.grid_columnconfigure(0, weight=1)
+        control_frame.grid_columnconfigure(1, weight=0)
+
+        ttk.Label(control_frame, text="Video / Camera / Stream", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(control_frame, textvariable=self.video_path_var, width=34).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
+        ttk.Button(control_frame, text="Browse", command=self.browse_video, style="Tool.TButton").grid(row=1, column=1, sticky="ew", pady=(1, 4))
+
+        ttk.Label(control_frame, text="YOLO model", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Combobox(
             control_frame,
             textvariable=self.model_path_var,
             values=self.available_models,
-            width=34,
+            width=32,
             state="normal",
-        ).grid(row=3, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(control_frame, text="Browse...", command=self.browse_model).grid(row=3, column=1, sticky="ew")
+        ).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
+        ttk.Button(control_frame, text="Browse", command=self.browse_model, style="Tool.TButton").grid(row=3, column=1, sticky="ew", pady=(1, 4))
 
-        ttk.Label(control_frame, text="Template CSV:").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(control_frame, textvariable=self.template_mapping_path_var, width=36).grid(row=5, column=0, sticky="ew", padx=(0, 4))
-        ttk.Button(control_frame, text="Browse...", command=self.browse_template_mapping).grid(row=5, column=1, sticky="ew")
+        ttk.Label(control_frame, text="Region template CSV", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Entry(control_frame, textvariable=self.template_mapping_path_var, width=34).grid(row=5, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
+        ttk.Button(control_frame, text="Browse", command=self.browse_template_mapping, style="Tool.TButton").grid(row=5, column=1, sticky="ew", pady=(1, 4))
 
-        ttk.Checkbutton(
-            control_frame,
-            text="Display Region Template",
-            variable=self.display_template_var,
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", pady=2)
+        options = ttk.Frame(control_frame, style="Card.TFrame")
+        options.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        options.grid_columnconfigure(0, weight=1)
+        options.grid_columnconfigure(1, weight=1)
+        ttk.Checkbutton(options, text="Show Regions", variable=self.display_template_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Export Flow Data", variable=self.export_fluid_var).grid(row=0, column=1, sticky="w")
 
-        ttk.Checkbutton(
-            control_frame,
-            text="Export Flow Data",
-            variable=self.export_fluid_var,
-        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=2)
-
-        ttk.Label(control_frame, text="Performance:").grid(row=8, column=0, sticky="w", pady=2)
+        perf_frame = ttk.Frame(control_frame, style="Card.TFrame")
+        perf_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        perf_frame.grid_columnconfigure(1, weight=1)
+        ttk.Label(perf_frame, text="Performance", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Combobox(
-            control_frame,
+            perf_frame,
             textvariable=self.performance_profile_var,
             values=list(PERFORMANCE_PROFILES.keys()),
             width=12,
             state="readonly",
-        ).grid(row=8, column=1, sticky="ew", pady=2)
+        ).grid(row=0, column=1, sticky="ew")
 
-        self.start_button = ttk.Button(control_frame, text="Start", command=self.start_processing)
-        self.start_button.grid(row=9, column=0, columnspan=2, pady=(6, 2), sticky="ew")
-        self.stop_button = ttk.Button(control_frame, text="Stop", command=self.stop_processing, state="disabled")
-        self.stop_button.grid(row=10, column=0, columnspan=2, sticky="ew")
+        button_frame = ttk.Frame(control_frame, style="Card.TFrame")
+        button_frame.grid(row=8, column=0, columnspan=2, sticky="ew")
+        button_frame.grid_columnconfigure(0, weight=1)
+        button_frame.grid_columnconfigure(1, weight=1)
+        self.start_button = ttk.Button(button_frame, text="▶ Start", command=self.start_processing, style="Accent.TButton")
+        self.start_button.grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        self.stop_button = ttk.Button(button_frame, text="■ Stop", command=self.stop_processing, state="disabled", style="Danger.TButton")
+        self.stop_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        control_frame.grid_columnconfigure(0, weight=1)
-        for child in control_frame.winfo_children():
-            child.grid_configure(padx=2, pady=2)
+        # ---------- Metrics ----------
+        # Compact layout: keep this short so count tables stay visible.
+        metrics_frame = ttk.LabelFrame(right_frame, text="  Realtime Metrics  ", padding=(8, 5))
+        metrics_frame.pack(fill="x", pady=(0, 6))
+        metrics_frame.grid_columnconfigure(0, weight=1)
+        metrics_frame.grid_columnconfigure(1, weight=1)
 
-        metrics_frame = ttk.LabelFrame(right_frame, text="Metrics")
-        metrics_frame.pack(fill="x", pady=(0, 8))
+        metric_items = [
+            ("Frame", "frame"),
+            ("FPS", "fps"),
+            ("Tracks", "active_tracks"),
+            ("PCE", "current_pce"),
+            ("Total", "flow_veh_pm"),
+        ]
+        for idx, (title, var_name) in enumerate(metric_items):
+            self._compact_metric(metrics_frame, idx // 2, idx % 2, title, var_name)
 
-        for row, (label_text, var_name) in enumerate([
-            ("Frame:", "frame"),
-            ("FPS:", "fps"),
-            ("Active tracks:", "active_tracks"),
-            ("Current PCE:", "current_pce"),
-            ("Total veh:", "flow_veh_pm"),
-        ]):
-            ttk.Label(metrics_frame, text=label_text).grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Label(metrics_frame, textvariable=self.metrics[var_name], width=28).grid(row=row, column=1, sticky="w")
+        # ---------- Count tables ----------
+        # Only one long 8-lane table is visible at a time, so the right panel
+        # stays compact and Vehicle Type Count Total is no longer hidden.
+        tables_notebook = ttk.Notebook(right_frame)
+        tables_notebook.pack(fill="both", expand=True, pady=(0, 6))
 
-        branch_frame = ttk.LabelFrame(metrics_frame, text="Branch Current PCE + Count")
-        branch_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0), padx=2)
-        headers = ["Direction", "PCE now", "Count now"]
-        for col, header in enumerate(headers):
+        branch_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
+        vehicle_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
+        tables_notebook.add(branch_frame, text="Current PCE + Count")
+        tables_notebook.add(vehicle_frame, text="Vehicle Type Total")
+
+        headers = ["Region", "PCE now", "Count now"]
+        for col, header_text in enumerate(headers):
             branch_frame.grid_columnconfigure(col, weight=1)
-            ttk.Label(branch_frame, text=header, anchor="center").grid(row=0, column=col, sticky="ew", padx=2)
+            self._table_label(branch_frame, text=header_text, style="TableHeader.TLabel").grid(row=0, column=col, sticky="ew", padx=1, pady=(0, 2))
 
         for row, branch in enumerate(BRANCH_ORDER, start=1):
-            ttk.Label(branch_frame, text=branch.title()).grid(row=row, column=0, sticky="w", padx=4)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_pce"], anchor="center").grid(row=row, column=1, sticky="ew", padx=2)
-            ttk.Label(branch_frame, textvariable=self.metrics[f"{branch}_count"], anchor="center").grid(row=row, column=2, sticky="ew", padx=2)
+            self._table_label(branch_frame, text=REGION_DISPLAY_NAMES.get(branch, branch.upper()), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
+            self._table_label(branch_frame, variable=self.metrics[f"{branch}_pce"], style="TableValue.TLabel").grid(row=row, column=1, sticky="ew", padx=1, pady=1)
+            self._table_label(branch_frame, variable=self.metrics[f"{branch}_count"], style="TableValue.TLabel").grid(row=row, column=2, sticky="ew", padx=1, pady=1)
 
-        vehicle_frame = ttk.LabelFrame(metrics_frame, text="Vehicle Type Count Total")
-        vehicle_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0), padx=2)
-        vehicle_headers = ["Direction", "Car In", "Car Out", "Moto In", "Moto Out"]
-        for col, header in enumerate(vehicle_headers):
+        vehicle_headers = ["Region"]
+        for cls_id in DISPLAY_CLASS_IDS:
+            class_name = CLASS_NAMES[cls_id]
+            vehicle_headers.append(self._vehicle_header_name(class_name, "In"))
+            vehicle_headers.append(self._vehicle_header_name(class_name, "Out"))
+
+        for col, header_text in enumerate(vehicle_headers):
             vehicle_frame.grid_columnconfigure(col, weight=1)
-            ttk.Label(vehicle_frame, text=header, anchor="center").grid(row=0, column=col, sticky="ew", padx=2)
+            self._table_label(vehicle_frame, text=header_text, style="TableHeader.TLabel").grid(row=0, column=col, sticky="ew", padx=1, pady=(0, 2))
 
         for row, branch in enumerate(BRANCH_ORDER, start=1):
-            ttk.Label(vehicle_frame, text=branch.title()).grid(row=row, column=0, sticky="w", padx=4)
-            ttk.Label(vehicle_frame, textvariable=self.metrics[f"{branch}_car_in"], anchor="center").grid(row=row, column=1, sticky="ew", padx=2)
-            ttk.Label(vehicle_frame, textvariable=self.metrics[f"{branch}_car_out"], anchor="center").grid(row=row, column=2, sticky="ew", padx=2)
-            ttk.Label(vehicle_frame, textvariable=self.metrics[f"{branch}_motorcycle_in"], anchor="center").grid(row=row, column=3, sticky="ew", padx=2)
-            ttk.Label(vehicle_frame, textvariable=self.metrics[f"{branch}_motorcycle_out"], anchor="center").grid(row=row, column=4, sticky="ew", padx=2)
+            self._table_label(vehicle_frame, text=REGION_DISPLAY_NAMES.get(branch, branch.upper()), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
+            col = 1
+            for cls_id in DISPLAY_CLASS_IDS:
+                class_name = CLASS_NAMES[cls_id]
+                self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_in"], style="TableValue.TLabel").grid(row=row, column=col, sticky="ew", padx=1, pady=1)
+                self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_out"], style="TableValue.TLabel").grid(row=row, column=col + 1, sticky="ew", padx=1, pady=1)
+                col += 2
 
-        status_frame = ttk.Frame(right_frame)
+        status_frame = ttk.Frame(right_frame, style="Subtle.TFrame", padding=(8, 5))
         status_frame.pack(fill="x")
-        ttk.Label(status_frame, text="Status:").grid(row=0, column=0, sticky="w")
-        ttk.Label(status_frame, textvariable=self.status_var, width=36).grid(row=0, column=1, sticky="w")
+        status_frame.grid_columnconfigure(1, weight=1)
+        ttk.Label(status_frame, text="Status", style="Status.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(status_frame, textvariable=self.status_var, style="StatusValue.TLabel", wraplength=300).grid(row=0, column=1, sticky="w")
 
     def browse_video(self):
         video_path = filedialog.askopenfilename(
@@ -240,10 +403,17 @@ class FlowApp:
 
     def load_region_template(self):
         mapping_path = self.template_mapping_path_var.get().strip()
-        if mapping_path and os.path.exists(mapping_path):
+
+        if not mapping_path:
+            self.region_template = None
+            self.status_var.set("No template selected; using margin regions")
+            return
+
+        if os.path.exists(mapping_path):
             self.region_template = RegionTemplate(mapping_path)
             if self.region_template.loaded:
-                self.status_var.set("Template loaded")
+                loaded_regions = ", ".join(self.region_template.regions.keys())
+                self.status_var.set(f"Template loaded: {loaded_regions}")
                 return
 
         self.region_template = None
@@ -319,7 +489,7 @@ class FlowApp:
         with self.state_lock:
             if self.latest_pil_image is not None:
                 self.latest_photo = ImageTk.PhotoImage(self.latest_pil_image)
-                self.video_label.configure(image=self.latest_photo)
+                self.video_label.configure(image=self.latest_photo, text="")
                 self.video_label.image = self.latest_photo
                 self.latest_pil_image = None
 
