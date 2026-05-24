@@ -23,6 +23,7 @@ from .config import (
     DEFAULT_TEMPLATE_MAPPING,
     DEFAULT_TRACK_SAMPLE_SECONDS,
     DISPLAY_CLASS_IDS,
+    REGION_DISPLAY_NAMES,
 )
 from .regions import RegionTemplate
 from .video_worker import process_video
@@ -137,6 +138,9 @@ class FlowApp:
 
         style.configure("TEntry", fieldbackground="#ffffff", foreground=UI["text"], bordercolor=UI["border"])
         style.configure("TCombobox", fieldbackground="#ffffff", foreground=UI["text"], bordercolor=UI["border"])
+        style.configure("TNotebook", background=UI["card"], borderwidth=0, tabmargins=(0, 2, 0, 0))
+        style.configure("TNotebook.Tab", background=UI["card_2"], foreground=UI["muted"], padding=(10, 5), font=("Segoe UI", 9, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", "#e0ecff"), ("active", "#f1f5f9")], foreground=[("selected", UI["accent_dark"])])
 
         style.configure("Accent.TButton", background=UI["success"], foreground="#ffffff", font=("Segoe UI", 10, "bold"), borderwidth=0, padding=(8, 6))
         style.map("Accent.TButton", background=[("active", "#15803d"), ("disabled", "#94a3b8")])
@@ -190,6 +194,16 @@ class FlowApp:
         label = ttk.Label(parent, text=text, textvariable=variable, style=style, anchor=anchor)
         return label
 
+    def _vehicle_header_name(self, class_name, direction):
+        short_names = {
+            "bicycle": "Bicycle",
+            "bus": "Bus",
+            "car": "Car",
+            "motorbike": "Motorbike",
+            "motorcycle": "Moto",
+        }
+        return f"{short_names.get(class_name, class_name.title())} {direction}"
+
     def _build_ui(self):
         shell = ttk.Frame(self.root, style="App.TFrame", padding=10)
         shell.grid(row=0, column=0, sticky="nsew")
@@ -202,7 +216,7 @@ class FlowApp:
         ttk.Label(header, text="Vehicle Flow Explorer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="YOLO + DeepSORT traffic counting, region analysis, and fluid-flow export",
+            text="YOLO + DeepSORT traffic counting, 8-lane region analysis, and fluid-flow export",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -316,33 +330,45 @@ class FlowApp:
         for idx, (title, var_name) in enumerate(metric_items):
             self._compact_metric(metrics_frame, idx // 2, idx % 2, title, var_name)
 
-        # ---------- Branch current state ----------
-        branch_frame = ttk.LabelFrame(right_frame, text="  Branch Current PCE + Count  ", padding=(6, 5))
-        branch_frame.pack(fill="x", pady=(0, 6))
+        # ---------- Count tables ----------
+        # Only one long 8-lane table is visible at a time, so the right panel
+        # stays compact and Vehicle Type Count Total is no longer hidden.
+        tables_notebook = ttk.Notebook(right_frame)
+        tables_notebook.pack(fill="both", expand=True, pady=(0, 6))
+
+        branch_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
+        vehicle_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
+        tables_notebook.add(branch_frame, text="Current PCE + Count")
+        tables_notebook.add(vehicle_frame, text="Vehicle Type Total")
+
         headers = ["Region", "PCE now", "Count now"]
         for col, header_text in enumerate(headers):
             branch_frame.grid_columnconfigure(col, weight=1)
             self._table_label(branch_frame, text=header_text, style="TableHeader.TLabel").grid(row=0, column=col, sticky="ew", padx=1, pady=(0, 2))
 
         for row, branch in enumerate(BRANCH_ORDER, start=1):
-            self._table_label(branch_frame, text=branch.title(), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
+            self._table_label(branch_frame, text=REGION_DISPLAY_NAMES.get(branch, branch.upper()), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_pce"], style="TableValue.TLabel").grid(row=row, column=1, sticky="ew", padx=1, pady=1)
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_count"], style="TableValue.TLabel").grid(row=row, column=2, sticky="ew", padx=1, pady=1)
 
-        # ---------- Vehicle type totals ----------
-        vehicle_frame = ttk.LabelFrame(right_frame, text="  Vehicle Type Count Total  ", padding=(6, 5))
-        vehicle_frame.pack(fill="x", pady=(0, 6))
-        vehicle_headers = ["Region", "Car In", "Car Out", "Moto In", "Moto Out"]
+        vehicle_headers = ["Region"]
+        for cls_id in DISPLAY_CLASS_IDS:
+            class_name = CLASS_NAMES[cls_id]
+            vehicle_headers.append(self._vehicle_header_name(class_name, "In"))
+            vehicle_headers.append(self._vehicle_header_name(class_name, "Out"))
+
         for col, header_text in enumerate(vehicle_headers):
             vehicle_frame.grid_columnconfigure(col, weight=1)
             self._table_label(vehicle_frame, text=header_text, style="TableHeader.TLabel").grid(row=0, column=col, sticky="ew", padx=1, pady=(0, 2))
 
         for row, branch in enumerate(BRANCH_ORDER, start=1):
-            self._table_label(vehicle_frame, text=branch.title(), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
-            self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_car_in"], style="TableValue.TLabel").grid(row=row, column=1, sticky="ew", padx=1, pady=1)
-            self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_car_out"], style="TableValue.TLabel").grid(row=row, column=2, sticky="ew", padx=1, pady=1)
-            self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_motorcycle_in"], style="TableValue.TLabel").grid(row=row, column=3, sticky="ew", padx=1, pady=1)
-            self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_motorcycle_out"], style="TableValue.TLabel").grid(row=row, column=4, sticky="ew", padx=1, pady=1)
+            self._table_label(vehicle_frame, text=REGION_DISPLAY_NAMES.get(branch, branch.upper()), style="TableCell.TLabel", anchor="w").grid(row=row, column=0, sticky="ew", padx=1, pady=1)
+            col = 1
+            for cls_id in DISPLAY_CLASS_IDS:
+                class_name = CLASS_NAMES[cls_id]
+                self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_in"], style="TableValue.TLabel").grid(row=row, column=col, sticky="ew", padx=1, pady=1)
+                self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_out"], style="TableValue.TLabel").grid(row=row, column=col + 1, sticky="ew", padx=1, pady=1)
+                col += 2
 
         status_frame = ttk.Frame(right_frame, style="Subtle.TFrame", padding=(8, 5))
         status_frame.pack(fill="x")
@@ -377,10 +403,17 @@ class FlowApp:
 
     def load_region_template(self):
         mapping_path = self.template_mapping_path_var.get().strip()
-        if mapping_path and os.path.exists(mapping_path):
+
+        if not mapping_path:
+            self.region_template = None
+            self.status_var.set("No template selected; using margin regions")
+            return
+
+        if os.path.exists(mapping_path):
             self.region_template = RegionTemplate(mapping_path)
             if self.region_template.loaded:
-                self.status_var.set("Template loaded")
+                loaded_regions = ", ".join(self.region_template.regions.keys())
+                self.status_var.set(f"Template loaded: {loaded_regions}")
                 return
 
         self.region_template = None

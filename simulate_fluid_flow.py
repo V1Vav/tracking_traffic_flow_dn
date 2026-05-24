@@ -37,9 +37,18 @@ from collections import Counter, defaultdict
 import cv2
 import numpy as np
 
-ROAD_BRANCHES = ("top", "right", "bottom", "left")
-REGIONS = ("top", "left", "right", "bottom", "center")
-ADJACENT_INFLOW_PAIRS = (("top", "right"), ("right", "bottom"), ("bottom", "left"), ("left", "top"))
+# 8 lane-region layout: *1 is inbound to center, *2 is outbound from center.
+INBOUND_LANES = ("t1", "r1", "b1", "l1")
+OUTBOUND_LANES = ("t2", "r2", "b2", "l2")
+ROAD_BRANCHES = ("t1", "t2", "r1", "r2", "b1", "b2", "l1", "l2")
+REGIONS = ROAD_BRANCHES + ("center",)
+ADJACENT_INFLOW_PAIRS = (("t1", "r1"), ("r1", "b1"), ("b1", "l1"), ("l1", "t1"))
+LANE_LABELS = {
+    "t1": "T1 IN", "t2": "T2 OUT",
+    "r1": "R1 IN", "r2": "R2 OUT",
+    "b1": "B1 IN", "b2": "B2 OUT",
+    "l1": "L1 IN", "l2": "L2 OUT",
+}
 CANVAS_SIZE = (1120, 820)
 SCENARIO_CHOICES = ("observed", "no_signal", "compare")
 SCENARIO_DISPLAY = {
@@ -49,10 +58,18 @@ SCENARIO_DISPLAY = {
 }
 CENTER = (560, 410)
 NODE_POS = {
-    "top": (560, 70),
-    "right": (1050, 410),
-    "bottom": (560, 750),
-    "left": (70, 410),
+    # Top lanes are side-by-side vertically into the center.
+    "t1": (520, 70),
+    "t2": (600, 70),
+    # Right lanes.
+    "r1": (1050, 370),
+    "r2": (1050, 450),
+    # Bottom lanes.
+    "b1": (600, 750),
+    "b2": (520, 750),
+    # Left lanes.
+    "l1": (70, 450),
+    "l2": (70, 370),
     "center": CENTER,
 }
 
@@ -317,25 +334,50 @@ def draw_center_grid(frame, args, warnings):
     cv2.putText(frame, f"CENTER size={args.center_size:g}", (x0 + 8, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, TEXT, 1, cv2.LINE_AA)
 
 
+def _center_anchor(branch, args):
+    """Lane-specific connection point on the edge of the center square."""
+    side = int(args.center_size * args.cell_px)
+    half = side // 2
+    offset = int(min(max(args.cell_px * 0.42, 12), max(half * 0.55, 12)))
+    cx, cy = CENTER
+    if branch == "t1":
+        return (cx - offset, cy - half)
+    if branch == "t2":
+        return (cx + offset, cy - half)
+    if branch == "r1":
+        return (cx + half, cy - offset)
+    if branch == "r2":
+        return (cx + half, cy + offset)
+    if branch == "b1":
+        return (cx + offset, cy + half)
+    if branch == "b2":
+        return (cx - offset, cy + half)
+    if branch == "l1":
+        return (cx - half, cy + offset)
+    if branch == "l2":
+        return (cx - half, cy - offset)
+    return CENTER
+
+
 def draw_base(frame, args, warnings):
     road_px = int(args.road_width * args.cell_px)
     for branch in ROAD_BRANCHES:
-        p1, p2 = NODE_POS[branch], CENTER
+        p1, p2 = NODE_POS[branch], _center_anchor(branch, args)
         cv2.line(frame, p1, p2, ROAD_COLOR, road_px, cv2.LINE_AA)
         cv2.line(frame, p1, p2, ROAD_EDGE, 2, cv2.LINE_AA)
 
     draw_center_grid(frame, args, warnings)
 
     label_offsets = {
-        "top": (-36, -24),
-        "right": (-78, -24),
-        "bottom": (-58, 42),
-        "left": (10, -24),
+        "t1": (-44, -24), "t2": (8, -24),
+        "r1": (-78, -18), "r2": (-78, 24),
+        "b1": (8, 42), "b2": (-58, 42),
+        "l1": (10, 28), "l2": (10, -20),
     }
     for name in ROAD_BRANCHES:
         pos = NODE_POS[name]
         dx, dy = label_offsets.get(name, (0, 0))
-        cv2.putText(frame, name.upper(), (pos[0] + dx, pos[1] + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.62, TEXT, 2, cv2.LINE_AA)
+        cv2.putText(frame, LANE_LABELS.get(name, name.upper()), (pos[0] + dx, pos[1] + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.50, TEXT, 1, cv2.LINE_AA)
 
 
 def flow_color(edge_data, args):
@@ -352,10 +394,11 @@ def draw_flow_edge(frame, branch, direction, edge_data, sim_time, args):
     if not edge_data or edge_data.get("pce_per_s", 0.0) <= 0:
         return
 
+    anchor = _center_anchor(branch, args)
     if direction == "in":
-        p1, p2 = NODE_POS[branch], CENTER
+        p1, p2 = NODE_POS[branch], anchor
     else:
-        p1, p2 = CENTER, NODE_POS[branch]
+        p1, p2 = anchor, NODE_POS[branch]
 
     offset = _direction_offset(branch, direction, args.cell_px, args.flow_layout)
     p1, p2 = _offset_points(p1, p2, offset)
@@ -397,7 +440,7 @@ def draw_queue_and_density(frame, states, args):
         pce = _float(states.get(branch, {}).get("queue_estimate_pce"), 0.0)
         if pce <= 0:
             continue
-        p1, p2 = NODE_POS[branch], CENTER
+        p1, p2 = NODE_POS[branch], _center_anchor(branch, args)
         alpha = min(0.50, 0.08 + pce * 0.025)
         q_end = _point_on_segment(p1, p2, alpha)
         q_thick = max(6, min(int(args.road_width * args.cell_px), int(6 + pce * args.cell_px * 0.16)))
@@ -466,13 +509,13 @@ def _edge_label_point(edge, args, index=0):
         return (CENTER[0] + int(args.center_size * args.cell_px * 0.65), CENTER[1] - 18 + index * 18)
 
     if a in ROAD_BRANCHES and b == "center":
-        p1, p2 = NODE_POS[a], CENTER
+        p1, p2 = NODE_POS[a], _center_anchor(a, args)
     elif a == "center" and b in ROAD_BRANCHES:
-        p1, p2 = CENTER, NODE_POS[b]
+        p1, p2 = _center_anchor(b, args), NODE_POS[b]
     elif a in ROAD_BRANCHES and b in ROAD_BRANCHES:
         # Adjacent-inflow warning: put it near the center between the two arms.
-        p1 = _point_on_segment(NODE_POS[a], CENTER, 0.78)
-        p2 = _point_on_segment(NODE_POS[b], CENTER, 0.78)
+        p1 = _point_on_segment(NODE_POS[a], _center_anchor(a, args), 0.78)
+        p2 = _point_on_segment(NODE_POS[b], _center_anchor(b, args), 0.78)
         return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2 + index * 18)
     else:
         return (820, 690 + index * 18)
@@ -558,8 +601,8 @@ def draw_hud(frame, sim_time, duration, args, source_path, paused, scenario="obs
         1,
         cv2.LINE_AA,
     )
-    cv2.putText(frame, f"road width={args.road_width:g} cells | center={args.center_size:g}x{args.center_size:g} cells | data={os.path.basename(source_path)}", (24, 87), cv2.FONT_HERSHEY_SIMPLEX, 0.46, MUTED, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"Pipe width = PCE/s converted to road cells | layout={args.flow_layout}. >= road width is severe.", (24, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.44, MUTED, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"lane width={args.road_width:g} cells | center={args.center_size:g}x{args.center_size:g} cells | data={os.path.basename(source_path)}", (24, 87), cv2.FONT_HERSHEY_SIMPLEX, 0.46, MUTED, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"Pipe width = PCE/s converted to lane cells | layout={args.flow_layout}. >= road width is severe.", (24, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.44, MUTED, 1, cv2.LINE_AA)
 
     x, y = 812, 34
     legend = (("observed", FLOW_OK), ("inferred", FLOW_INFERRED), ("unknown", FLOW_UNKNOWN), ("warning", FLOW_WARNING), ("critical", FLOW_CRITICAL))

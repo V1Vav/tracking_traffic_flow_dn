@@ -23,10 +23,15 @@ from .config import (
     CLASS_CONF_THRESHOLDS,
     CLASS_NAMES,
     CLASS_WEIGHTS,
+    COUNTED_CLASS_IDS,
+    DETECT_CLASS_IDS,
     CV2_NUM_THREADS,
     DEBUG_TRACK_LOGS,
     EDGE_LOST_OUT_FRAMES,
     FRAME_EXIT_MARGIN_RATIO,
+    HIDDEN_LEFT_INBOUND_REGION,
+    HIDDEN_LEFT_OUTBOUND_REGION,
+    INBOUND_LANE_REGIONS,
     DETECTION_DUPLICATE_CENTER_RATIO,
     DETECTION_DUPLICATE_CONTAINMENT,
     DETECTION_DUPLICATE_IOU,
@@ -132,7 +137,7 @@ def _put_frame(frame_queue, frame, realtime_source, stop_event):
 
 def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height):
     """Class-specific confidence + loose geometry filters for stable detection."""
-    if cls not in CLASS_WEIGHTS:
+    if cls not in DETECT_CLASS_IDS:
         return False
 
     min_conf = CLASS_CONF_THRESHOLDS.get(cls, 0.25)
@@ -230,12 +235,28 @@ def _boxes_look_duplicate(
     return False
 
 
-def _suppress_duplicate_detections(detections):
-    """Class-agnostic duplicate suppression before DeepSORT.
+def _detections_can_suppress(det_a, det_b):
+    """Return True when duplicate suppression may remove one detection.
 
-    YOLO NMS is already applied, but fine-tuned small models can still output
-    several very similar boxes for one motorcycle/car. If these boxes reach
-    DeepSORT, they become separate IDs and remain visible for many frames.
+    Keep person-vs-vehicle overlaps because a rider/person box can legitimately
+    overlap a motorbike/car box. Vehicle-vs-vehicle remains class-agnostic to
+    collapse class flicker duplicates such as car/motorbike on the same object.
+    """
+    cls_a = int(det_a[2])
+    cls_b = int(det_b[2])
+    counted_a = cls_a in COUNTED_CLASS_IDS
+    counted_b = cls_b in COUNTED_CLASS_IDS
+    if counted_a != counted_b:
+        return False
+    return True
+
+
+def _suppress_duplicate_detections(detections):
+    """Duplicate suppression before DeepSORT.
+
+    Counted vehicles are suppressed class-agnostically to avoid one vehicle
+    becoming several IDs. Person detections are kept separate from vehicles so
+    they can still be displayed without affecting vehicle tracking/counting.
     """
     if len(detections) <= 1:
         return detections
@@ -253,6 +274,8 @@ def _suppress_duplicate_detections(detections):
         box = _xywh_to_ltrb(det[0])
         duplicate = False
         for kept_det in kept:
+            if not _detections_can_suppress(det, kept_det):
+                continue
             kept_box = _xywh_to_ltrb(kept_det[0])
             if _boxes_look_duplicate(
                 box,
@@ -339,6 +362,31 @@ def _emit_active_branch_out(
     return emitted
 
 
+def _track_effective_cls(track, track_meta):
+    det_cls = getattr(track, "det_class", None)
+    if det_cls is not None:
+        try:
+            return int(det_cls)
+        except Exception:
+            pass
+    meta = track_meta.get(track.track_id, {})
+    cls = meta.get("stable_cls", meta.get("cls"))
+    try:
+        return int(cls) if cls is not None else None
+    except Exception:
+        return None
+
+
+def _tracks_can_suppress(track_a, track_b, track_meta):
+    cls_a = _track_effective_cls(track_a, track_meta)
+    cls_b = _track_effective_cls(track_b, track_meta)
+    counted_a = cls_a in COUNTED_CLASS_IDS
+    counted_b = cls_b in COUNTED_CLASS_IDS
+    if counted_a != counted_b:
+        return False
+    return True
+
+
 def _track_conf(track):
     try:
         conf = getattr(track, "det_conf", None)
@@ -374,6 +422,8 @@ def _suppress_duplicate_tracks(tracks, track_meta):
         box = _track_ltrb(track)
         is_duplicate = False
         for kept_track in kept:
+            if not _tracks_can_suppress(track, kept_track, track_meta):
+                continue
             kept_box = _track_ltrb(kept_track)
             if _boxes_look_duplicate(
                 box,
@@ -459,6 +509,20 @@ def _near_hidden_left_gate(centroid, frame_width, app):
     return float(centroid[0]) <= frame_width * ratio
 
 
+def _is_counted_cls(cls):
+    try:
+        return int(cls) in COUNTED_CLASS_IDS
+    except Exception:
+        return False
+
+
+def _is_detect_cls(cls):
+    try:
+        return int(cls) in DETECT_CLASS_IDS
+    except Exception:
+        return False
+
+
 def _fluid_export_enabled(app):
     try:
         return bool(app.export_fluid_var.get())
@@ -528,7 +592,7 @@ def _predict_yolo(model, frame, *, model_imgsz, device, use_half, max_det):
         "imgsz": int(model_imgsz),
         "conf": MODEL_CONF,
         "iou": MODEL_IOU,
-        "classes": list(CLASS_WEIGHTS.keys()),
+        "classes": list(DETECT_CLASS_IDS),
         "verbose": False,
         "max_det": int(max_det),
     }
@@ -680,9 +744,9 @@ def process_video(app, video_path, model_path):
             )
 
         if app.region_template and app.region_template.loaded:
-            # Center is always a valid row in the UI. If template.csv has an
-            # explicit center polygon, get_direction_region() will use it;
-            # otherwise any point outside the outer polygons becomes center.
+            # Center is always a valid row in the UI. Lane regions are valid
+            # only when present in template.csv; this supports partial templates
+            # while preserving the 8-lane layout in config.py.
             valid_branches = (set(app.region_template.regions.keys()) & VALID_BRANCHES) | {"center"}
         else:
             valid_branches = set(VALID_BRANCHES)
@@ -822,6 +886,7 @@ def process_video(app, video_path, model_path):
                     and meta.get("last_fluid_region") == "center"
                     and _near_hidden_left_gate(last_centroid, frame_w, app)
                     and not meta.get("fluid_closed_to_left", False)
+                    and _is_counted_cls(meta.get("active_branch_cls", meta.get("stable_cls", meta.get("cls", -1))))
                 ):
                     _export_track_transition(
                         exporter,
@@ -830,7 +895,7 @@ def process_video(app, video_path, model_path):
                         frame_id=frame_id,
                         current_time=current_time,
                         from_region="center",
-                        to_region="left",
+                        to_region=HIDDEN_LEFT_OUTBOUND_REGION,
                         cls=meta.get("active_branch_cls", meta.get("stable_cls", meta.get("cls", 2))),
                         box=meta.get("last_box"),
                         centroid=last_centroid,
@@ -866,20 +931,24 @@ def process_video(app, video_path, model_path):
                 if det_cls is None:
                     det_cls = track_meta.get(track_id, {}).get("stable_cls", 2)
 
-                if int(det_cls) not in CLASS_WEIGHTS:
+                if not _is_detect_cls(det_cls):
                     continue
 
                 active_tracks += 1
                 centroid = centroid_from_box((l, t, r, b))
+                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
+                previous_centroid = meta.get("last_centroid")
+                previous_region = meta.get("current_region") or meta.get("stable_region")
                 raw_region = get_direction_region(
                     centroid,
                     frame.shape[1],
                     frame.shape[0],
                     app.region_margin,
                     app.region_template,
+                    previous_centroid=previous_centroid,
+                    current_region=previous_region,
                 )
 
-                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
                 meta["last_seen_frame"] = frame_id
                 meta["last_box"] = (l, t, r, b)
                 meta["duplicate_of"] = None
@@ -902,7 +971,7 @@ def process_video(app, video_path, model_path):
                         source="observed",
                     )
 
-                    if stable_region in valid_branches:
+                    if stable_region in valid_branches and _is_counted_cls(cls):
                         previous_fluid_region = meta.get("last_fluid_region")
                         if previous_fluid_region is None:
                             # First stable region for this track. If it appears
@@ -920,7 +989,7 @@ def process_video(app, video_path, model_path):
                                     track_id=track_id,
                                     frame_id=frame_id,
                                     current_time=current_time,
-                                    from_region="left",
+                                    from_region=HIDDEN_LEFT_INBOUND_REGION,
                                     to_region="center",
                                     cls=cls,
                                     box=(l, t, r, b),
@@ -950,7 +1019,7 @@ def process_video(app, video_path, model_path):
                             meta["last_fluid_region"] = stable_region
 
                 if stable_region is not None:
-                    current_is_branch = stable_region in valid_branches
+                    current_is_branch = stable_region in valid_branches and _is_counted_cls(cls)
                     active_branch = meta.get("active_branch")
 
                     if active_branch in valid_branches and stable_region != active_branch:
@@ -1022,7 +1091,8 @@ def process_video(app, video_path, model_path):
                     continue
 
                 region = meta.get("current_region")
-                if region in valid_branches:
+                cls = meta.get("stable_cls", meta.get("cls", -1))
+                if region in valid_branches and _is_counted_cls(cls):
                     branch_current_pce[region] += meta.get("weight", 0.0)
                     branch_current_count[region] += 1
 
@@ -1081,10 +1151,10 @@ def process_video(app, video_path, model_path):
                     metric_updates[f"{branch}_{class_name}_out"] = str(branch_class_count_total[(branch, "out", cls_id)])
 
                 total_current_pce += pce_now
-                if branch != "center":
-                    # Total veh uses outer-direction IN events only. Center is
-                    # shown as its own row but excluded to avoid double counting
-                    # one vehicle again when it passes through the intersection.
+                if branch in INBOUND_LANE_REGIONS:
+                    # Total vehicles uses only inbound-lane entry events.
+                    # Outbound lanes and center are excluded to avoid counting
+                    # the same vehicle again after it passes through center.
                     total_in_count += branch_count_total[(branch, "in")]
 
             realtime_ratio = fps / fps_input if fps_input > 0 else 0.0
@@ -1154,7 +1224,7 @@ def process_video(app, video_path, model_path):
                     final_updates[f"{branch}_{class_name}_in"] = str(branch_class_count_total[(branch, "in", cls_id)])
                     final_updates[f"{branch}_{class_name}_out"] = str(branch_class_count_total[(branch, "out", cls_id)])
 
-                if branch != "center":
+                if branch in INBOUND_LANE_REGIONS:
                     total_in_count += branch_count_total[(branch, "in")]
 
             with app.state_lock:
