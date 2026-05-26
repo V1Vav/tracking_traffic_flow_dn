@@ -1,4 +1,4 @@
-"""Region template loading, region detection, and region drawing helpers."""
+"""Hàm hỗ trợ tải template vùng, xác định vùng và vẽ vùng."""
 
 import csv
 import math
@@ -19,35 +19,35 @@ from .config import (
     VALID_BRANCHES,
 )
 
-# OpenCV uses BGR colors. Colors are intentionally soft so the video remains readable.
+# OpenCV dùng màu BGR. Màu được chọn dịu để video vẫn dễ quan sát.
 REGION_COLORS = {
-    # OpenCV uses BGR. The palette is grouped by lane meaning:
-    #   * Lane 1 / IN  : cooler colors
-    #   * Lane 2 / OUT : warmer colors
-    # Paired lanes such as t1/t2 still use clearly different hues, while the
-    # fill alpha remains low so vehicles and tracking boxes stay readable.
-    "t1": (222, 168, 78),    # blue - top inbound
-    "t2": (97, 162, 244),    # amber - top outbound
-    "l1": (136, 183, 82),    # green - left inbound
-    "l2": (107, 107, 255),   # coral - left outbound
-    "r1": (229, 93, 155),    # violet - right inbound
-    "r2": (0, 127, 247),     # orange - right outbound
-    "b1": (216, 180, 0),     # teal - bottom inbound
-    "b2": (106, 196, 233),   # yellow - bottom outbound
+    # OpenCV dùng BGR. Bảng màu được nhóm theo ý nghĩa làn:
+    #   * Làn 1 / VÀO : nhóm màu lạnh hơn
+    #   * Làn 2 / RA  : nhóm màu ấm hơn
+    # Các cặp làn như t1/t2 vẫn dùng sắc độ khác nhau rõ ràng, trong khi
+    # alpha fill được giữ thấp để xe và box tracking vẫn dễ nhìn.
+    "t1": (222, 168, 78),    # xanh lam - làn trên đi vào
+    "t2": (97, 162, 244),    # vàng hổ phách - làn trên đi ra
+    "l1": (136, 183, 82),    # xanh lá - làn trái đi vào
+    "l2": (107, 107, 255),   # cam san hô - làn trái đi ra
+    "r1": (229, 93, 155),    # tím - làn phải đi vào
+    "r2": (0, 127, 247),     # cam - làn phải đi ra
+    "b1": (216, 180, 0),     # xanh ngọc - làn dưới đi vào
+    "b2": (106, 196, 233),   # vàng - làn dưới đi ra
     "center": (184, 163, 148),
     "outside": (120, 128, 140),
 }
 REGION_LABELS = {
-    "t1": "T1 IN",
-    "t2": "T2 OUT",
-    "l1": "L1 IN",
-    "l2": "L2 OUT",
-    "r1": "R1 IN",
-    "r2": "R2 OUT",
-    "b1": "B1 IN",
-    "b2": "B2 OUT",
+    "t1": "T1 VÀO",
+    "t2": "T2 RA",
+    "l1": "L1 VÀO",
+    "l2": "L2 RA",
+    "r1": "R1 VÀO",
+    "r2": "R2 RA",
+    "b1": "B1 VÀO",
+    "b2": "B2 RA",
     "center": "CENTER",
-    "outside": "OUTSIDE",
+    "outside": "NGOÀI",
 }
 
 _APPROACH_LANES = {
@@ -64,17 +64,17 @@ class RegionTemplate:
         self.regions = {}
         self.resolution = None
         self.loaded = False
-        # Cache scaled points/contours per frame size. With 8 lane polygons,
-        # this avoids rescaling every polygon for every tracked object.
+        # Cache điểm/contour đã scale theo kích thước frame. Với 8 polygon làn,
+        # cách này tránh scale lại mọi polygon cho từng object được track.
         self._scaled_cache = {}
         self._load_mapping()
 
     def _parse_point_row(self, row):
-        """Parse any row formatted as name,x1,y1,x2,y2,...
+        """Đọc một dòng có dạng name,x1,y1,x2,y2,...
 
-        Old templates used 4 points. The parser accepts any polygon with at
-        least 4 points, so center or lane-change polygons can be more detailed.
-        Empty cells are ignored to keep CSV editing simple.
+        Template cũ dùng 4 điểm. Bộ đọc này nhận mọi polygon có ít nhất 4 điểm,
+        nên vùng center hoặc vùng chuyển làn có thể chi tiết hơn.
+        Ô rỗng được bỏ qua để chỉnh CSV dễ hơn.
         """
         values = [cell.strip() for cell in row[1:] if cell.strip() != ""]
         if len(values) < 8 or len(values) % 2 != 0:
@@ -108,25 +108,25 @@ class RegionTemplate:
                 if region is None:
                     continue
 
-                # In the 8-lane layout, reject old 4-region names or typos
-                # instead of silently loading them. Accepted final names are:
+                # Trong bố cục 8 làn, từ chối tên 4 vùng cũ hoặc tên gõ sai
+                # thay vì âm thầm load. Các tên hợp lệ là:
                 # t1,t2,l1,l2,r1,r2,b1,b2,center.
                 if region not in VALID_BRANCHES:
                     print(
-                        f"Ignoring unsupported region '{region_name}' in template. "
-                        "Use t1,t2,l1,l2,r1,r2,b1,b2,center."
+                        f"Bỏ qua vùng không hỗ trợ '{region_name}' trong template. "
+                        "Hãy dùng t1,t2,l1,l2,r1,r2,b1,b2,center."
                     )
                     continue
 
                 points = self._parse_point_row(row)
                 if len(points) >= 4:
                     self.regions[region] = points
-                    print(f"Loaded region {region}: {points}")
+                    print(f"Đã tải vùng {region}: {points}")
 
             self.loaded = bool(self.regions)
-            print(f"RegionTemplate loaded: {self.loaded}, regions: {list(self.regions.keys())}")
+            print(f"RegionTemplate đã tải: {self.loaded}, vùng: {list(self.regions.keys())}")
         except Exception as exc:
-            print(f"Error loading mapping: {exc}")
+            print(f"Lỗi khi tải mapping: {exc}")
             self.regions = {}
             self.loaded = False
 
@@ -158,8 +158,8 @@ class RegionTemplate:
                 "center": _safe_label_center(contour, frame_width, frame_height),
             }
 
-        # Keep a tiny cache because the processing frame size can differ from
-        # display size, but it normally only has 1-2 entries.
+        # Giữ cache nhỏ vì kích thước frame xử lý có thể khác
+        # kích thước hiển thị, nhưng thường chỉ có 1-2 mục.
         if len(self._scaled_cache) >= 4:
             self._scaled_cache.clear()
         self._scaled_cache[key] = data
@@ -176,10 +176,10 @@ class RegionTemplate:
         return frame_width * 0.5, frame_height * 0.5
 
     def get_regions(self, centroid, width, height):
-        """Return all regions containing centroid, preserving template order.
+        """Trả về tất cả vùng chứa centroid, giữ thứ tự trong template.
 
-        Overlapping lane polygons are allowed. The final single region is chosen
-        by get_region(), which uses motion direction to disambiguate lane 1/2.
+        Cho phép các polygon làn chồng lên nhau. Vùng cuối cùng sẽ được chọn
+        bởi get_region(), có dùng hướng di chuyển để phân biệt làn 1/2.
         """
         if not self.loaded:
             return []
@@ -188,7 +188,7 @@ class RegionTemplate:
         if x < 0 or y < 0 or x >= width or y >= height:
             return []
 
-        # Center is tested first because it is the semantic junction node.
+        # Center được kiểm tra trước vì đây là nút giao về mặt ngữ nghĩa.
         region_order = ["center"] if "center" in self.regions else []
         region_order += [name for name in LANE_REGION_ORDER if name in self.regions]
         region_order += [name for name in self.regions.keys() if name not in set(region_order)]
@@ -223,7 +223,7 @@ class RegionTemplate:
         polygons = []
         scaled_cache = self._get_scaled_cache(width, height)
         added = set()
-        # Draw lanes before center so center outline stays readable.
+        # Vẽ các làn trước center để viền center vẫn dễ nhìn.
         for region_name in LANE_REGION_ORDER + ("center",):
             entry = scaled_cache.get(region_name)
             if entry:
@@ -240,12 +240,11 @@ def _dist(a, b):
 
 
 def choose_region_from_candidates(candidates, *, centroid, previous_centroid=None, current_region=None, center_point=None):
-    """Choose one region when polygons overlap.
+    """Chọn một vùng khi các polygon chồng lên nhau.
 
-    If a point lies in both lane 1 and lane 2 of the same approach, use movement
-    direction relative to the center: moving closer to center => lane 1; moving
-    away from center => lane 2. This makes lane-changing overlap usable instead
-    of causing random label flicker.
+    Nếu một điểm nằm trong cả làn 1 và làn 2 của cùng một nhánh, dùng hướng
+    di chuyển so với center: tiến gần center => làn 1; đi xa center => làn 2.
+    Nhờ đó vùng chồng lấn do lấn/chuyển làn dùng được, thay vì label nhảy ngẫu nhiên.
     """
     if not candidates:
         return None
@@ -253,8 +252,8 @@ def choose_region_from_candidates(candidates, *, centroid, previous_centroid=Non
         return candidates[0]
 
     if "center" in candidates:
-        # Center is the intersection node. Prefer it over lane overlap so route
-        # export gets explicit lane->center and center->lane transitions.
+        # Center là nút giao. Ưu tiên center hơn vùng chồng lấn làn để route
+        # export có chuyển tiếp rõ ràng lane->center và center->lane.
         return "center"
 
     candidate_set = set(candidates)
@@ -282,8 +281,8 @@ def choose_region_from_candidates(candidates, *, centroid, previous_centroid=Non
                 return keep_current
             return in_region
 
-    # If overlap is between different approaches, keep previous region when
-    # possible; otherwise fall back to deterministic display/order priority.
+    # Nếu vùng chồng lấn thuộc các nhánh khác nhau, giữ vùng trước đó khi
+    # có thể; nếu không thì dùng thứ tự ưu tiên cố định.
     if keep_current:
         return keep_current
     for region_name in LANE_REGION_ORDER:
@@ -298,7 +297,7 @@ def centroid_from_box(box):
 
 
 def get_direction_region(centroid, width, height, margin_fraction, template=None, previous_centroid=None, current_region=None):
-    """Return raw region from polygon template or fallback 8-lane regions."""
+    """Trả về vùng thô từ template polygon hoặc vùng 8 làn mặc định."""
     if template and template.loaded:
         region = template.get_region(
             centroid,
@@ -318,8 +317,8 @@ def get_direction_region(centroid, width, height, margin_fraction, template=None
     if left_margin <= x <= right_margin and top_margin <= y <= bottom_margin:
         return "center"
 
-    # Fallback split: each outer approach is divided into lane 1/lane 2. This is
-    # only for quick testing; template.csv should be used for accurate geometry.
+    # Chia fallback: mỗi nhánh ngoài được chia thành làn 1/làn 2. Cách này
+    # chỉ dùng để test nhanh; nên dùng template.csv để có hình học chính xác.
     if y < top_margin:
         return "t1" if x < width * 0.5 else "t2"
     if y > bottom_margin:
@@ -347,7 +346,7 @@ def _safe_label_center(contour, frame_width, frame_height):
 
 
 def _draw_readable_label(frame, text, center, color):
-    """Draw a readable but subtle label pill."""
+    """Vẽ label dạng pill dễ đọc nhưng không quá chói."""
     x, y = center
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = 0.50 if len(text) > 6 else 0.56
@@ -381,11 +380,10 @@ def _draw_readable_label(frame, text, center, color):
 
 
 def draw_region_polygons(frame, polygons, alpha=0.065):
-    """Draw soft region fills, high-contrast outlines, and compact labels.
+    """Vẽ nền vùng nhẹ, viền tương phản và label gọn.
 
-    No direction arrows are drawn here. With 8 lane regions, arrows made the
-    overlay noisy; the lane identity is communicated by distinct lane colors
-    plus the label text such as T1 IN / T2 OUT.
+    Không vẽ mũi tên hướng ở đây. Với 8 vùng làn, mũi tên làm overlay rối;
+    danh tính làn được thể hiện bằng màu riêng và label như T1 VÀO / T2 RA.
     """
     if not polygons:
         return
@@ -403,17 +401,17 @@ def draw_region_polygons(frame, polygons, alpha=0.065):
         center = _safe_label_center(contour, width, height)
         prepared.append((region_name, contour, color, center))
 
-    # Slightly stronger than before so t1/t2 are distinguishable, still low
-    # enough to keep vehicles and boxes visible.
+    # Đậm hơn một chút để t1/t2 dễ phân biệt, nhưng vẫn đủ nhẹ
+    # để xe và box vẫn thấy rõ.
     cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
 
-    # Draw a dark outline first, then a colored outline. This separates
-    # overlapping lane polygons without requiring arrows or strong fill color.
+    # Vẽ viền tối trước, rồi viền màu sau. Cách này tách
+    # các polygon làn chồng nhau mà không cần mũi tên hoặc fill quá mạnh.
     for region_name, contour, color, center in prepared:
         cv2.polylines(frame, [contour], True, (10, 16, 28), 3, cv2.LINE_AA)
         cv2.polylines(frame, [contour], True, color, 2, cv2.LINE_AA)
 
-    # Draw compact labels last so names remain readable on bright frames.
+    # Vẽ label gọn sau cùng để tên vùng vẫn đọc được trên frame sáng.
     for region_name, contour, color, center in prepared:
         label = REGION_LABELS.get(region_name, REGION_SHORT_LABELS.get(region_name, region_name.upper()))
         _draw_readable_label(frame, label, center, color)
@@ -421,8 +419,8 @@ def draw_region_polygons(frame, polygons, alpha=0.065):
 
 def draw_region_overlay(frame, margin_fraction, template=None):
     """
-    Draw region overlay only when explicitly called.
-    If template is unavailable, draw fallback 8-lane margin regions.
+    Chỉ vẽ overlay vùng khi được gọi rõ ràng.
+    Nếu không có template, vẽ vùng biên 8 làn mặc định.
     """
     if template and template.loaded:
         template.overlay(frame)

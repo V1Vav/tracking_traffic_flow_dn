@@ -1,4 +1,4 @@
-"""Tkinter UI application for vehicle flow analysis."""
+"""Ứng dụng giao diện Tkinter cho phân tích lưu lượng phương tiện."""
 
 import os
 import threading
@@ -49,7 +49,7 @@ UI = {
 class FlowApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Vehicle Flow Explorer · AI Traffic Analytics")
+        self.root.title("Phân tích lưu lượng phương tiện · AI Traffic Analytics")
         self.root.geometry("1360x820")
         self.root.minsize(1120, 720)
         self.root.configure(bg=UI["bg"])
@@ -60,15 +60,15 @@ class FlowApp:
         self.video_path_var = tk.StringVar(value="")
         self.model_path_var = tk.StringVar(value=DEFAULT_MODEL_PATH)
         self.template_mapping_path_var = tk.StringVar(value=DEFAULT_TEMPLATE_MAPPING)
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="Sẵn sàng")
         self.available_models = DEFAULT_AVAILABLE_MODELS
         self.performance_profile_var = tk.StringVar(value=DEFAULT_PERFORMANCE_PROFILE)
 
         self.region_template = None
         self.display_template_var = tk.BooleanVar(value=True)
 
-        # Fluid-flow export options. Keep the UI compact: only the checkbox is
-        # exposed in the main screen. Advanced values still have safe defaults.
+        # Tùy chọn xuất dữ liệu flow dạng chất lỏng. Giữ UI gọn: chỉ hiển thị checkbox
+        # trên màn hình chính. Các giá trị nâng cao vẫn dùng mặc định an toàn.
         self.export_fluid_var = tk.BooleanVar(value=False)
         self.infer_hidden_left_var = tk.BooleanVar(value=DEFAULT_INFER_HIDDEN_LEFT)
         self.export_root_var = tk.StringVar(value=DEFAULT_EXPORT_ROOT)
@@ -151,7 +151,7 @@ class FlowApp:
 
     def _default_worker_state(self):
         state = {
-            "status": "Ready",
+            "status": "Sẵn sàng",
             "frame": "0",
             "fps": "0.0",
             "active_tracks": "0",
@@ -196,13 +196,15 @@ class FlowApp:
 
     def _vehicle_header_name(self, class_name, direction):
         short_names = {
-            "bicycle": "Bicycle",
-            "bus": "Bus",
-            "car": "Car",
-            "motorbike": "Motorbike",
-            "motorcycle": "Moto",
+            "bicycle": "Xe đạp",
+            "bus": "Xe buýt",
+            "car": "Ô tô",
+            "motorbike": "Xe máy",
+            "motorcycle": "Xe máy",
         }
-        return f"{short_names.get(class_name, class_name.title())} {direction}"
+        
+        direction_names = {"In": "Vào", "Out": "Ra", "in": "Vào", "out": "Ra"}
+        return f"{short_names.get(class_name, class_name.title())} {direction_names.get(direction, direction)}"
 
     def _build_ui(self):
         shell = ttk.Frame(self.root, style="App.TFrame", padding=10)
@@ -213,10 +215,10 @@ class FlowApp:
         header = ttk.Frame(shell, style="Header.TFrame")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         header.grid_columnconfigure(0, weight=1)
-        ttk.Label(header, text="Vehicle Flow Explorer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Phân tích lưu lượng phương tiện", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
-            text="YOLO + DeepSORT traffic counting, 8-lane region analysis, and fluid-flow export",
+            text="Đếm phương tiện bằng YOLO + DeepSORT, phân tích 8 làn và xuất dữ liệu dòng chảy",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
@@ -244,12 +246,12 @@ class FlowApp:
         video_header = ttk.Frame(video_card, style="Card.TFrame")
         video_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         video_header.grid_columnconfigure(0, weight=1)
-        ttk.Label(video_header, text="Live Preview", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(video_header, text="Regions are highlighted when Show Regions is enabled", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(video_header, text="Xem video trực tiếp", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(video_header, text="Các vùng sẽ được tô nổi bật khi bật Hiển thị vùng", style="Muted.TLabel").grid(row=1, column=0, sticky="w")
 
         self.video_label = tk.Label(
             video_card,
-            text="Select a video, camera index, or stream URL\nthen press Start",
+            text="Chọn video, chỉ số camera hoặc URL stream\nrồi bấm Bắt đầu",
             anchor="center",
             justify="center",
             bg=UI["video_bg"],
@@ -261,17 +263,17 @@ class FlowApp:
         )
         self.video_label.grid(row=1, column=0, sticky="nsew")
 
-        # ---------- Controls ----------
-        control_frame = ttk.LabelFrame(right_frame, text="  Controls  ", padding=8)
+        # ---------- Điều khiển ----------
+        control_frame = ttk.LabelFrame(right_frame, text="  Điều khiển  ", padding=8)
         control_frame.pack(fill="x", pady=(0, 6))
         control_frame.grid_columnconfigure(0, weight=1)
         control_frame.grid_columnconfigure(1, weight=0)
 
-        ttk.Label(control_frame, text="Video / Camera / Stream", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(control_frame, text="Video / Camera / Luồng", style="Card.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(control_frame, textvariable=self.video_path_var, width=34).grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
-        ttk.Button(control_frame, text="Browse", command=self.browse_video, style="Tool.TButton").grid(row=1, column=1, sticky="ew", pady=(1, 4))
+        ttk.Button(control_frame, text="Chọn", command=self.browse_video, style="Tool.TButton").grid(row=1, column=1, sticky="ew", pady=(1, 4))
 
-        ttk.Label(control_frame, text="YOLO model", style="Card.TLabel").grid(row=2, column=0, sticky="w")
+        ttk.Label(control_frame, text="Model YOLO", style="Card.TLabel").grid(row=2, column=0, sticky="w")
         ttk.Combobox(
             control_frame,
             textvariable=self.model_path_var,
@@ -279,23 +281,23 @@ class FlowApp:
             width=32,
             state="normal",
         ).grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
-        ttk.Button(control_frame, text="Browse", command=self.browse_model, style="Tool.TButton").grid(row=3, column=1, sticky="ew", pady=(1, 4))
+        ttk.Button(control_frame, text="Chọn", command=self.browse_model, style="Tool.TButton").grid(row=3, column=1, sticky="ew", pady=(1, 4))
 
-        ttk.Label(control_frame, text="Region template CSV", style="Card.TLabel").grid(row=4, column=0, sticky="w")
+        ttk.Label(control_frame, text="File mẫu vùng CSV", style="Card.TLabel").grid(row=4, column=0, sticky="w")
         ttk.Entry(control_frame, textvariable=self.template_mapping_path_var, width=34).grid(row=5, column=0, sticky="ew", padx=(0, 6), pady=(1, 4))
-        ttk.Button(control_frame, text="Browse", command=self.browse_template_mapping, style="Tool.TButton").grid(row=5, column=1, sticky="ew", pady=(1, 4))
+        ttk.Button(control_frame, text="Chọn", command=self.browse_template_mapping, style="Tool.TButton").grid(row=5, column=1, sticky="ew", pady=(1, 4))
 
         options = ttk.Frame(control_frame, style="Card.TFrame")
         options.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         options.grid_columnconfigure(0, weight=1)
         options.grid_columnconfigure(1, weight=1)
-        ttk.Checkbutton(options, text="Show Regions", variable=self.display_template_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(options, text="Export Flow Data", variable=self.export_fluid_var).grid(row=0, column=1, sticky="w")
+        ttk.Checkbutton(options, text="Hiển thị vùng", variable=self.display_template_var).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(options, text="Xuất dữ liệu flow", variable=self.export_fluid_var).grid(row=0, column=1, sticky="w")
 
         perf_frame = ttk.Frame(control_frame, style="Card.TFrame")
         perf_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         perf_frame.grid_columnconfigure(1, weight=1)
-        ttk.Label(perf_frame, text="Performance", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(perf_frame, text="Hiệu năng", style="Card.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Combobox(
             perf_frame,
             textvariable=self.performance_profile_var,
@@ -308,14 +310,14 @@ class FlowApp:
         button_frame.grid(row=8, column=0, columnspan=2, sticky="ew")
         button_frame.grid_columnconfigure(0, weight=1)
         button_frame.grid_columnconfigure(1, weight=1)
-        self.start_button = ttk.Button(button_frame, text="▶ Start", command=self.start_processing, style="Accent.TButton")
+        self.start_button = ttk.Button(button_frame, text="▶ Bắt đầu", command=self.start_processing, style="Accent.TButton")
         self.start_button.grid(row=0, column=0, padx=(0, 4), sticky="ew")
-        self.stop_button = ttk.Button(button_frame, text="■ Stop", command=self.stop_processing, state="disabled", style="Danger.TButton")
+        self.stop_button = ttk.Button(button_frame, text="■ Dừng", command=self.stop_processing, state="disabled", style="Danger.TButton")
         self.stop_button.grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        # ---------- Metrics ----------
-        # Compact layout: keep this short so count tables stay visible.
-        metrics_frame = ttk.LabelFrame(right_frame, text="  Realtime Metrics  ", padding=(8, 5))
+        # ---------- Chỉ số ----------
+        # Bố cục gọn để các bảng đếm vẫn nhìn thấy rõ.
+        metrics_frame = ttk.LabelFrame(right_frame, text="  Chỉ số thời gian thực  ", padding=(8, 5))
         metrics_frame.pack(fill="x", pady=(0, 6))
         metrics_frame.grid_columnconfigure(0, weight=1)
         metrics_frame.grid_columnconfigure(1, weight=1)
@@ -323,25 +325,25 @@ class FlowApp:
         metric_items = [
             ("Frame", "frame"),
             ("FPS", "fps"),
-            ("Tracks", "active_tracks"),
+            ("Track", "active_tracks"),
             ("PCE", "current_pce"),
-            ("Total", "flow_veh_pm"),
+            ("Tổng", "flow_veh_pm"),
         ]
         for idx, (title, var_name) in enumerate(metric_items):
             self._compact_metric(metrics_frame, idx // 2, idx % 2, title, var_name)
 
-        # ---------- Count tables ----------
-        # Only one long 8-lane table is visible at a time, so the right panel
-        # stays compact and Vehicle Type Count Total is no longer hidden.
+        # ---------- Bảng đếm ----------
+        # Chỉ hiển thị một bảng dài 8 làn tại một thời điểm để panel bên phải
+        # luôn gọn và bảng tổng theo loại xe không bị khuất.
         tables_notebook = ttk.Notebook(right_frame)
         tables_notebook.pack(fill="both", expand=True, pady=(0, 6))
 
         branch_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
         vehicle_frame = ttk.Frame(tables_notebook, style="Card.TFrame", padding=(6, 5))
-        tables_notebook.add(branch_frame, text="Current PCE + Count")
-        tables_notebook.add(vehicle_frame, text="Vehicle Type Total")
+        tables_notebook.add(branch_frame, text="PCE + số lượng hiện tại")
+        tables_notebook.add(vehicle_frame, text="Tổng theo loại xe")
 
-        headers = ["Region", "PCE now", "Count now"]
+        headers = ["Vùng", "PCE hiện tại", "Số hiện tại"]
         for col, header_text in enumerate(headers):
             branch_frame.grid_columnconfigure(col, weight=1)
             self._table_label(branch_frame, text=header_text, style="TableHeader.TLabel").grid(row=0, column=col, sticky="ew", padx=1, pady=(0, 2))
@@ -351,7 +353,7 @@ class FlowApp:
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_pce"], style="TableValue.TLabel").grid(row=row, column=1, sticky="ew", padx=1, pady=1)
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_count"], style="TableValue.TLabel").grid(row=row, column=2, sticky="ew", padx=1, pady=1)
 
-        vehicle_headers = ["Region"]
+        vehicle_headers = ["Vùng"]
         for cls_id in DISPLAY_CLASS_IDS:
             class_name = CLASS_NAMES[cls_id]
             vehicle_headers.append(self._vehicle_header_name(class_name, "In"))
@@ -373,29 +375,29 @@ class FlowApp:
         status_frame = ttk.Frame(right_frame, style="Subtle.TFrame", padding=(8, 5))
         status_frame.pack(fill="x")
         status_frame.grid_columnconfigure(1, weight=1)
-        ttk.Label(status_frame, text="Status", style="Status.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(status_frame, text="Trạng thái", style="Status.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Label(status_frame, textvariable=self.status_var, style="StatusValue.TLabel", wraplength=300).grid(row=0, column=1, sticky="w")
 
     def browse_video(self):
         video_path = filedialog.askopenfilename(
-            title="Select video file",
-            filetypes=[("Video files", "*.mp4 *.avi *.mov *.mkv"), ("All files", "*")],
+            title="Chọn file video",
+            filetypes=[("File video", "*.mp4 *.avi *.mov *.mkv"), ("Tất cả file", "*")],
         )
         if video_path:
             self.video_path_var.set(video_path)
 
     def browse_model(self):
         model_path = filedialog.askopenfilename(
-            title="Select YOLO model file",
-            filetypes=[("PyTorch model", "*.pt *.pth"), ("All files", "*")],
+            title="Chọn file model YOLO",
+            filetypes=[("Model PyTorch", "*.pt *.pth"), ("Tất cả file", "*")],
         )
         if model_path:
             self.model_path_var.set(model_path)
 
     def browse_template_mapping(self):
         mapping_path = filedialog.askopenfilename(
-            title="Select template mapping CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*")],
+            title="Chọn file CSV mẫu vùng",
+            filetypes=[("File CSV", "*.csv"), ("Tất cả file", "*")],
         )
         if mapping_path:
             self.template_mapping_path_var.set(mapping_path)
@@ -406,18 +408,18 @@ class FlowApp:
 
         if not mapping_path:
             self.region_template = None
-            self.status_var.set("No template selected; using margin regions")
+            self.status_var.set("Chưa chọn template; dùng vùng biên mặc định")
             return
 
         if os.path.exists(mapping_path):
             self.region_template = RegionTemplate(mapping_path)
             if self.region_template.loaded:
                 loaded_regions = ", ".join(self.region_template.regions.keys())
-                self.status_var.set(f"Template loaded: {loaded_regions}")
+                self.status_var.set(f"Đã tải template: {loaded_regions}")
                 return
 
         self.region_template = None
-        self.status_var.set("Template unavailable; using margin regions")
+        self.status_var.set("Không dùng được template; dùng vùng biên mặc định")
 
     def _float_from_var(self, var, default, min_value=None, max_value=None):
         try:
@@ -455,10 +457,10 @@ class FlowApp:
         model_path = self.model_path_var.get().strip()
 
         if not video_path:
-            messagebox.showwarning("Missing video", "Please choose a video file, type camera index like 0, or paste RTSP/HTTP stream URL.")
+            messagebox.showwarning("Thiếu video", "Vui lòng chọn file video, nhập chỉ số camera như 0, hoặc dán URL RTSP/HTTP.")
             return
         if not model_path:
-            messagebox.showwarning("Missing model", "Please choose a YOLO model file first.")
+            messagebox.showwarning("Thiếu model", "Vui lòng chọn file model YOLO trước.")
             return
 
         self.load_region_template()
@@ -467,7 +469,7 @@ class FlowApp:
 
         with self.state_lock:
             self.worker_state = self._default_worker_state()
-            self.worker_state["status"] = "Loading model..."
+            self.worker_state["status"] = "Đang tải model..."
 
         self._normalize_export_settings()
         self._normalize_performance_settings()
@@ -483,7 +485,7 @@ class FlowApp:
     def stop_processing(self):
         self.stop_event.set()
         self.stop_button.config(state="disabled")
-        self.status_var.set("Stopping...")
+        self.status_var.set("Đang dừng...")
 
     def _update_ui(self):
         with self.state_lock:

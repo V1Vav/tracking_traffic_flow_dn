@@ -1,4 +1,4 @@
-"""Counting, debounce, PCE, and sliding-window flow helpers."""
+"""Hàm hỗ trợ đếm, chống nhiễu vùng, PCE và flow theo cửa sổ trượt."""
 
 from collections import Counter, deque
 
@@ -38,12 +38,12 @@ def create_track_meta(frame_id, cls):
 
 
 def update_stable_class(meta, det_cls, det_conf=None):
-    """Smooth class predictions across one DeepSORT track with hysteresis.
+    """Làm mượt dự đoán class trên một track DeepSORT bằng hysteresis.
 
-    YOLO class output can flicker frame-by-frame, especially between motorcycle
-    and car in dense Vietnamese traffic. The stable class is used for PCE and
-    type counts. After a class becomes stable, it is locked for a few frames and
-    only changes when another class wins by a stronger vote ratio.
+    Kết quả class của YOLO có thể nhảy theo từng frame, đặc biệt giữa xe máy
+    và ô tô trong giao thông Việt Nam đông đúc. Class ổn định được dùng cho PCE
+    và đếm theo loại xe. Sau khi class ổn định, nó được khóa trong vài frame và
+    chỉ đổi khi class khác thắng với tỉ lệ vote mạnh hơn.
     """
     stable_cls = meta.get("stable_cls", meta.get("cls", 2))
 
@@ -77,7 +77,7 @@ def update_stable_class(meta, det_cls, det_conf=None):
     if best_cls == stable_cls:
         stable_cls = best_cls
     elif stable_age < CLASS_LOCK_MIN_FRAMES:
-        # Keep the current label during the initial lock period.
+        # Giữ nhãn hiện tại trong giai đoạn khóa ban đầu.
         stable_cls = stable_cls
     elif (
         raw_votes[best_cls] >= CLASS_SWITCH_MIN_VOTES
@@ -101,7 +101,7 @@ def update_stable_class(meta, det_cls, det_conf=None):
 
 
 def update_stable_region(meta, raw_region):
-    """Debounce region changes to avoid edge jitter count noise."""
+    """Chống nhiễu khi đổi vùng để tránh đếm sai ở mép polygon."""
     meta["raw_history"].append(raw_region)
 
     if len(meta["raw_history"]) < STABLE_REGION_FRAMES:
@@ -147,13 +147,12 @@ def calc_veh_per_min(events, window_seconds):
 
 
 def mark_branch_enter(meta, branch, counted=False, event_cls=None):
-    """Remember that this track is currently inside one region/branch.
+    """Ghi nhớ track này hiện đang nằm trong một vùng/nhánh.
 
-    ``counted`` tells whether the IN event was actually accepted by the
-    cooldown logic. OUT will only be counted for a visit that had a counted IN.
-    ``event_cls`` freezes the vehicle type for the whole visit, preventing the
-    common mismatch where a motorcycle is counted as Moto In but its smoothed
-    label switches before OUT.
+    ``counted`` cho biết event IN có thật sự được logic cooldown chấp nhận hay không.
+    OUT chỉ được đếm cho lượt đã có IN được đếm.
+    ``event_cls`` khóa loại phương tiện cho toàn bộ lượt đi, tránh lỗi thường gặp
+    khi xe máy được đếm là Moto In nhưng nhãn đã làm mượt lại đổi trước OUT.
     """
     meta["active_branch"] = branch
     meta["active_branch_counted"] = bool(counted)
@@ -161,7 +160,7 @@ def mark_branch_enter(meta, branch, counted=False, event_cls=None):
 
 
 def mark_branch_exit(meta, branch):
-    """Clear active region if the track is leaving that region."""
+    """Xóa vùng đang hoạt động nếu track rời khỏi vùng đó."""
     if meta.get("active_branch") == branch:
         meta["active_branch"] = None
         meta["active_branch_counted"] = False
@@ -181,7 +180,7 @@ def emit_branch_event(
     event_cls=None,
     force=False,
 ):
-    """Update total counters and sliding-window flow events for one branch event."""
+    """Cập nhật bộ đếm tổng và event flow cửa sổ trượt cho một event nhánh."""
     if not force and not can_emit_event(meta, branch, direction, frame_id):
         return False
     if force:

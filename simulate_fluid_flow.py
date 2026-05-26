@@ -1,103 +1,138 @@
-"""Replay exported traffic flow as a fluid-like road diagram.
+"""Mô phỏng lại dữ liệu flow thật 8 làn được xuất từ ứng dụng chính.
 
-This simulator reads real event-level flow data by default:
+Chương trình này chỉ dùng dữ liệu xuất thật:
+- flow_edges_real.csv cho các sự kiện chuyển vùng thật
+- region_state_timeseries.csv cho trạng thái PCE/mật độ quan sát được
 
-    flow_edges_real.csv
-
-The export step does not interpolate, smooth, or resample that file. Runtime
-parameters here decide how to aggregate the raw events, so the same recording can
-be viewed as 0.5 s, 1 s, 5 s, or RL-step demand without re-running detection.
-
-Examples:
-    python simulate_fluid_flow.py flow_exports/<run_dir>
-    python simulate_fluid_flow.py flow_exports/<run_dir> --speed 0.5
-    python simulate_fluid_flow.py flow_exports/<run_dir> --bin-seconds 3 --smooth-seconds 6
-    python simulate_fluid_flow.py flow_exports/<run_dir> --road-width 3 --center-size 3
-    python simulate_fluid_flow.py flow_exports/<run_dir> --flow-layout center
-    python simulate_fluid_flow.py flow_exports/<run_dir> --flow-layout right_left
-    python simulate_fluid_flow.py flow_exports/<run_dir> --scenario observed
-    python simulate_fluid_flow.py flow_exports/<run_dir> --scenario no_signal
-    python simulate_fluid_flow.py flow_exports/<run_dir> --scenario compare
-    python simulate_fluid_flow.py flow_exports/<run_dir> --save fluid_replay.mp4 --no-window
-
-Window controls:
-    Space: pause/resume
-    q/Esc: quit
-    ] / [: faster / slower
+Không nội suy, không tạo kịch bản giả định không đèn, không mô phỏng hành vi
+đèn giao thông. Các tham số runtime chỉ thay đổi cách hiển thị/gom cửa sổ,
+không thay đổi dữ liệu gốc.
 """
 
+from __future__ import annotations
+
 import argparse
-import bisect
 import csv
-import math
 import os
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Tuple
 
 import cv2
 import numpy as np
 
-# 8 lane-region layout: *1 is inbound to center, *2 is outbound from center.
-INBOUND_LANES = ("t1", "r1", "b1", "l1")
-OUTBOUND_LANES = ("t2", "r2", "b2", "l2")
-ROAD_BRANCHES = ("t1", "t2", "r1", "r2", "b1", "b2", "l1", "l2")
-REGIONS = ROAD_BRANCHES + ("center",)
-ADJACENT_INFLOW_PAIRS = (("t1", "r1"), ("r1", "b1"), ("b1", "l1"), ("l1", "t1"))
-LANE_LABELS = {
-    "t1": "T1 IN", "t2": "T2 OUT",
-    "r1": "R1 IN", "r2": "R2 OUT",
-    "b1": "B1 IN", "b2": "B2 OUT",
-    "l1": "L1 IN", "l2": "L2 OUT",
-}
-CANVAS_SIZE = (1120, 820)
-SCENARIO_CHOICES = ("observed", "no_signal", "compare")
-SCENARIO_DISPLAY = {
-    "observed": "OBSERVED REAL FLOW",
-    "no_signal": "HYPOTHETICAL NO-SIGNAL",
-    "compare": "COMPARE",
-}
-CENTER = (560, 410)
-NODE_POS = {
-    # Top lanes are side-by-side vertically into the center.
-    "t1": (520, 70),
-    "t2": (600, 70),
-    # Right lanes.
-    "r1": (1050, 370),
-    "r2": (1050, 450),
-    # Bottom lanes.
-    "b1": (600, 750),
-    "b2": (520, 750),
-    # Left lanes.
-    "l1": (70, 450),
-    "l2": (70, 370),
-    "center": CENTER,
+# ----------------------------- Hằng số bố cục -----------------------------
+
+CANVAS_W = 1120
+CANVAS_H = 780
+CENTER = (560, 390)
+LANES = ("t1", "t2", "l1", "l2", "r1", "r2", "b1", "b2")
+INBOUND = {"t1", "l1", "r1", "b1"}
+OUTBOUND = {"t2", "l2", "r2", "b2"}
+REGIONS = LANES + ("center",)
+
+REGION_LABELS = {
+    "t1": "T1 VÀO", "t2": "T2 RA",
+    "l1": "L1 VÀO", "l2": "L2 RA",
+    "r1": "R1 VÀO", "r2": "R2 RA",
+    "b1": "B1 VÀO", "b2": "B2 RA",
+    "center": "CENTER",
 }
 
-# OpenCV uses BGR.
-BACKGROUND = (20, 22, 26)
-ROAD_COLOR = (50, 54, 62)
-ROAD_EDGE = (83, 88, 96)
-CENTER_COLOR = (42, 46, 54)
-GRID_COLOR = (86, 90, 100)
-TEXT = (235, 238, 242)
-MUTED = (160, 166, 174)
-FLOW_OK = (70, 205, 120)
-FLOW_INFERRED = (70, 170, 255)
-FLOW_UNKNOWN = (150, 150, 150)
-FLOW_WARNING = (30, 200, 255)
-FLOW_CRITICAL = (40, 70, 245)
-QUEUE_COLOR = (75, 80, 185)
-COLLISION_COLOR = (30, 30, 240)
+# Màu BGR
+BG = (15, 23, 42)
+PANEL = (30, 41, 59)
+ROAD = (62, 74, 96)
+ROAD_EDGE = (100, 116, 139)
+CENTER_FILL = (51, 65, 85)
+CENTER_EDGE = (148, 163, 184)
+TEXT = (241, 245, 249)
+MUTED = (148, 163, 184)
+FLOW_OK = (94, 234, 212)
+FLOW_INFERRED = (45, 212, 191)
+FLOW_UNKNOWN = (156, 163, 175)
+FLOW_WARNING = (0, 191, 255)
+FLOW_CRITICAL = (0, 85, 255)
+QUEUE_COLOR = (250, 204, 21)
+UNEXPECTED = (147, 51, 234)
 
-SOURCE_COLOR = {
-    "observed": FLOW_OK,
-    "inferred": FLOW_INFERRED,
-    "unknown": FLOW_UNKNOWN,
-    "none": (80, 80, 80),
+LANE_COLORS = {
+    "t1": (222, 168, 78), "t2": (97, 162, 244),
+    "l1": (136, 183, 82), "l2": (107, 107, 255),
+    "r1": (229, 93, 155), "r2": (0, 127, 247),
+    "b1": (216, 180, 0), "b2": (106, 196, 233),
 }
 
 
-def _float(value, default=0.0):
+@dataclass
+class Event:
+    time_s: float
+    frame: int
+    track_id: str
+    from_region: str
+    to_region: str
+    pce: float
+    class_name: str
+    source: str
+    edge_type: str
+    valid_8lane: bool
+
+
+# ----------------------------- Hàm hỗ trợ hình học -----------------------------
+
+def center_side(args) -> int:
+    return int(args.center_size * args.cell_px)
+
+
+def lane_points(args) -> Dict[str, Tuple[Tuple[int, int], Tuple[int, int]]]:
+    """Trả về điểm ngoài làn và điểm neo sát center cho từng vùng 8 làn."""
+    side = center_side(args)
+    half = side // 2
+    lane_sep = max(28, int(args.cell_px * 1.20))
+    cx, cy = CENTER
+
+    return {
+        # Nhánh trên: t1 đi vào center, t2 đi ra phía trên.
+        "t1": ((cx - lane_sep, 80), (cx - lane_sep, cy - half)),
+        "t2": ((cx + lane_sep, 80), (cx + lane_sep, cy - half)),
+        # Nhánh trái: l1 đi vào center, l2 đi ra phía trái.
+        "l1": ((90, cy + lane_sep), (cx - half, cy + lane_sep)),
+        "l2": ((90, cy - lane_sep), (cx - half, cy - lane_sep)),
+        # Nhánh phải: r1 đi vào center, r2 đi ra phía phải.
+        "r1": ((CANVAS_W - 90, cy - lane_sep), (cx + half, cy - lane_sep)),
+        "r2": ((CANVAS_W - 90, cy + lane_sep), (cx + half, cy + lane_sep)),
+        # Nhánh dưới: b1 đi vào center, b2 đi ra phía dưới.
+        "b1": ((cx + lane_sep, CANVAS_H - 70), (cx + lane_sep, cy + half)),
+        "b2": ((cx - lane_sep, CANVAS_H - 70), (cx - lane_sep, cy + half)),
+    }
+
+
+def edge_points(edge: Tuple[str, str], args) -> List[Tuple[int, int]]:
+    a, b = edge
+    points = lane_points(args)
+    if a in LANES and b == "center":
+        outer, anchor = points[a]
+        return [outer, anchor]
+    if a == "center" and b in LANES:
+        outer, anchor = points[b]
+        return [anchor, outer]
+    if a in LANES and b in LANES:
+        a_outer, a_anchor = points[a]
+        b_outer, b_anchor = points[b]
+        return [a_outer, a_anchor, b_anchor, b_outer]
+    if a == "center" and b == "center":
+        return [CENTER, CENTER]
+    return [CENTER, CENTER]
+
+
+def point_on_segment(p1, p2, t):
+    return (int(p1[0] + (p2[0] - p1[0]) * t), int(p1[1] + (p2[1] - p1[1]) * t))
+
+
+# ------------------------------- Đọc dữ liệu --------------------------------
+
+def float_value(value, default=0.0):
     try:
         if value is None or value == "":
             return default
@@ -106,7 +141,7 @@ def _float(value, default=0.0):
         return default
 
 
-def _int(value, default=0):
+def int_value(value, default=0):
     try:
         if value is None or value == "":
             return default
@@ -115,618 +150,429 @@ def _int(value, default=0):
         return default
 
 
-class RawFlowData:
-    def __init__(self, events):
-        self.events = sorted(events, key=lambda e: e["time_s"])
-        self.times = [e["time_s"] for e in self.events]
-        self.duration = self.times[-1] if self.times else 0.0
-
-    def window(self, start_t, end_t):
-        if not self.events:
-            return []
-        lo = bisect.bisect_left(self.times, start_t)
-        hi = bisect.bisect_right(self.times, end_t)
-        return self.events[lo:hi]
+def is_valid_8lane_edge(from_region: str, to_region: str) -> bool:
+    return (from_region in INBOUND and to_region == "center") or (from_region == "center" and to_region in OUTBOUND)
 
 
-def read_raw_edges(run_dir):
-    """Read real edge events. Prefer flow_edges_real.csv, fallback to transition CSV."""
-    candidates = [
-        os.path.join(run_dir, "flow_edges_real.csv"),
-        os.path.join(run_dir, "region_transitions.csv"),
-    ]
-    path = next((p for p in candidates if os.path.exists(p)), "")
-    if not path:
-        raise FileNotFoundError("Missing flow_edges_real.csv or region_transitions.csv")
-
-    events = []
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            from_region = row.get("from_region", "")
-            to_region = row.get("to_region", "")
-            if from_region not in REGIONS or to_region not in REGIONS:
-                continue
-            events.append({
-                "time_s": _float(row.get("time_s")),
-                "frame": _int(row.get("frame")),
-                "track_id": row.get("track_id", ""),
-                "from_region": from_region,
-                "to_region": to_region,
-                "edge": row.get("edge") or f"{from_region}->{to_region}",
-                "pce": _float(row.get("pce"), _float(row.get("pce_sum"), 0.0)),
-                "vehicle_count": _int(row.get("vehicle_count"), 1),
-                "class_name": row.get("class_name", ""),
-                "source": "inferred" if row.get("source", "unknown") == "mixed" else row.get("source", "unknown"),
-                "confidence": _float(row.get("confidence"), _float(row.get("mean_confidence"), 0.0)),
-                "reason": row.get("reason", ""),
-            })
-    return RawFlowData(events), path
+def edge_type(from_region: str, to_region: str) -> str:
+    if from_region in INBOUND and to_region == "center":
+        return "inbound_to_center"
+    if from_region == "center" and to_region in OUTBOUND:
+        return "center_to_outbound"
+    if from_region in OUTBOUND and to_region == "center":
+        return "outbound_to_center_unexpected"
+    if from_region == "center" and to_region in INBOUND:
+        return "center_to_inbound_unexpected"
+    if from_region in LANES and to_region in LANES:
+        return "lane_to_lane_direct"
+    return "other"
 
 
-def read_region_states(run_dir):
-    path = os.path.join(run_dir, "region_state_timeseries.csv")
-    rows_by_region = defaultdict(list)
-    all_times = set()
+def find_csv(run_dir: str, name: str) -> str:
+    path = os.path.join(run_dir, name)
     if not os.path.exists(path):
-        return [], rows_by_region
+        raise FileNotFoundError(f"Thiếu {name} trong {run_dir}")
+    return path
 
+
+def load_events(run_dir: str, args) -> List[Event]:
+    path = find_csv(run_dir, "flow_edges_real.csv")
+    events: List[Event] = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            t = round(_float(row.get("time_s")), 3)
-            region = row.get("region", "")
-            if region not in REGIONS:
+            fr = row.get("from_region", "")
+            to = row.get("to_region", "")
+            if fr not in REGIONS or to not in REGIONS:
                 continue
-            item = {
-                "time_s": t,
-                "pce_now": _float(row.get("pce_now")),
-                "vehicle_count_now": _float(row.get("vehicle_count_now")),
-                "queue_estimate_pce": _float(row.get("queue_estimate_pce")),
-                "source": row.get("source", "observed"),
-            }
-            rows_by_region[region].append(item)
-            all_times.add(t)
-    for region in rows_by_region:
-        rows_by_region[region].sort(key=lambda r: r["time_s"])
-    return sorted(all_times), rows_by_region
+            valid = str(row.get("is_valid_8lane_edge", "")).strip()
+            valid_bool = valid in {"1", "true", "True"} if valid != "" else is_valid_8lane_edge(fr, to)
+            if args.valid_edges_only and not valid_bool:
+                continue
+            events.append(Event(
+                time_s=float_value(row.get("time_s")),
+                frame=int_value(row.get("frame")),
+                track_id=str(row.get("track_id", "")),
+                from_region=fr,
+                to_region=to,
+                pce=float_value(row.get("pce")),
+                class_name=row.get("class_name", ""),
+                source=row.get("source", "observed") or "observed",
+                edge_type=row.get("edge_type", "") or edge_type(fr, to),
+                valid_8lane=valid_bool,
+            ))
+    events.sort(key=lambda e: e.time_s)
+    return events
 
 
-def _merge_source_names(*sources):
-    """Collapse source names without creating a visual 'mixed' class."""
-    clean = [s for s in sources if s and s != "none"]
-    if not clean:
-        return "none"
-    if "unknown" in clean:
-        return "unknown"
-    if "inferred" in clean or "mixed" in clean:
-        return "inferred"
-    return "observed"
+def load_state_rows(run_dir: str) -> Dict[str, List[dict]]:
+    path = os.path.join(run_dir, "region_state_timeseries.csv")
+    rows_by_region: Dict[str, List[dict]] = {r: [] for r in REGIONS}
+    if not os.path.exists(path):
+        return rows_by_region
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            region = row.get("region", "")
+            if region not in rows_by_region:
+                continue
+            rows_by_region[region].append({
+                "time_s": float_value(row.get("time_s")),
+                "vehicle_count_now": float_value(row.get("vehicle_count_now")),
+                "pce_now": float_value(row.get("pce_now")),
+                "queue_estimate_pce": float_value(row.get("queue_estimate_pce"), float_value(row.get("pce_now"))),
+            })
+    for rows in rows_by_region.values():
+        rows.sort(key=lambda r: r["time_s"])
+    return rows_by_region
 
 
-def _state_at_region(region_rows, t, interpolate=False):
-    if not region_rows:
-        return {"pce_now": 0.0, "vehicle_count_now": 0.0, "queue_estimate_pce": 0.0, "source": "none"}
-    times = [r["time_s"] for r in region_rows]
-    idx = bisect.bisect_right(times, t) - 1
-    if idx < 0:
-        return region_rows[0]
-    if not interpolate or idx >= len(region_rows) - 1:
-        return region_rows[idx]
-    a = region_rows[idx]
-    b = region_rows[idx + 1]
-    span = max(b["time_s"] - a["time_s"], 1e-6)
-    alpha = min(max((t - a["time_s"]) / span, 0.0), 1.0)
-    return {
-        "time_s": t,
-        "pce_now": a["pce_now"] + (b["pce_now"] - a["pce_now"]) * alpha,
-        "vehicle_count_now": a["vehicle_count_now"] + (b["vehicle_count_now"] - a["vehicle_count_now"]) * alpha,
-        "queue_estimate_pce": a["queue_estimate_pce"] + (b["queue_estimate_pce"] - a["queue_estimate_pce"]) * alpha,
-        "source": _merge_source_names(a.get("source", "observed"), b.get("source", "observed")),
-    }
+def state_at_or_before(rows_by_region: Dict[str, List[dict]], sim_time: float) -> Dict[str, dict]:
+    # Không nội suy: dùng snapshot thật gần nhất tại hoặc trước sim_time.
+    out = {}
+    for region, rows in rows_by_region.items():
+        best = None
+        for row in rows:
+            if row["time_s"] <= sim_time:
+                best = row
+            else:
+                break
+        out[region] = best or {"time_s": 0.0, "vehicle_count_now": 0.0, "pce_now": 0.0, "queue_estimate_pce": 0.0}
+    return out
 
 
-def get_state_at_time(rows_by_region, t, interpolate=False):
-    return {region: _state_at_region(rows_by_region.get(region, []), t, interpolate) for region in REGIONS}
+def events_in_window(events: List[Event], start: float, end: float) -> List[Event]:
+    return [e for e in events if start <= e.time_s <= end]
 
 
-def _combine_sources(counter):
-    if not counter:
-        return "none"
-    nonzero = [k for k, v in counter.items() if v > 0]
-    if not nonzero:
-        return "none"
-    return _merge_source_names(*nonzero)
+def aggregate_edges(events: List[Event], sim_time: float, args) -> Dict[Tuple[str, str], dict]:
+    start = max(0.0, sim_time - args.window_seconds)
+    win = events_in_window(events, start, sim_time)
+    agg = defaultdict(lambda: {"pce": 0.0, "count": 0, "sources": Counter(), "classes": Counter(), "valid": True, "edge_type": ""})
+    for e in win:
+        key = (e.from_region, e.to_region)
+        item = agg[key]
+        item["pce"] += e.pce
+        item["count"] += 1
+        item["sources"][e.source] += 1
+        item["classes"][e.class_name] += 1
+        item["valid"] = item["valid"] and e.valid_8lane
+        item["edge_type"] = e.edge_type
+    for key, item in agg.items():
+        pce_per_s = item["pce"] / max(args.window_seconds, 1e-6)
+        item["pce_per_s"] = pce_per_s
+        item["width_units"] = pce_per_s / max(args.lane_capacity_pceps, 1e-6)
+    return dict(agg)
 
 
-def aggregate_events(raw_data, sim_time, args):
-    """Aggregate raw events at runtime using CLI parameters."""
-    bin_s = max(args.bin_seconds, 1e-3)
-    smooth_s = max(args.smooth_seconds, 0.0)
-    # For visualization and RL stepping, smoothing is a runtime decision. A value
-    # of 0 means use only bin_seconds.
-    window_s = max(bin_s, smooth_s if smooth_s > 0 else bin_s)
-    start_t = max(0.0, sim_time - window_s)
-    events = raw_data.window(start_t, sim_time)
+# ----------------------------------- Vẽ hiển thị ---------------------------------
 
-    acc = defaultdict(lambda: {
-        "pce_sum": 0.0,
-        "vehicle_count": 0,
-        "source_counter": Counter(),
-        "confidence_sum": 0.0,
-        "confidence_count": 0,
-    })
-
-    for e in events:
-        key = (e["from_region"], e["to_region"])
-        item = acc[key]
-        item["pce_sum"] += e["pce"]
-        item["vehicle_count"] += e.get("vehicle_count", 1)
-        item["source_counter"][e.get("source", "unknown")] += 1
-        item["confidence_sum"] += e.get("confidence", 0.0)
-        item["confidence_count"] += 1
-
-    edges = {}
-    for key, item in acc.items():
-        mean_conf = item["confidence_sum"] / max(item["confidence_count"], 1)
-        pce_per_s = item["pce_sum"] / window_s
-        width_units = pce_per_s / max(args.lane_capacity_pceps, 1e-6)
-        edges[key] = {
-            "pce_sum": item["pce_sum"],
-            "pce_per_s": pce_per_s,
-            "pce_per_min": pce_per_s * 60.0,
-            "vehicle_count": item["vehicle_count"],
-            "source": _combine_sources(item["source_counter"]),
-            "confidence": mean_conf,
-            "width_units": width_units,
-        }
-    return edges
+def draw_text(frame, text, pos, scale=0.48, color=TEXT, thickness=1):
+    cv2.putText(frame, text, pos, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
 
 
-def _point_on_segment(p1, p2, alpha):
-    return (
-        int(p1[0] + (p2[0] - p1[0]) * alpha),
-        int(p1[1] + (p2[1] - p1[1]) * alpha),
-    )
-
-
-def _offset_points(p1, p2, offset):
-    x1, y1 = p1
-    x2, y2 = p2
-    dx = x2 - x1
-    dy = y2 - y1
-    length = max(math.hypot(dx, dy), 1.0)
-    ox = -dy / length * offset
-    oy = dx / length * offset
-    return (int(x1 + ox), int(y1 + oy)), (int(x2 + ox), int(y2 + oy))
-
-
-def _direction_offset(branch, direction, lane_px, flow_layout="center"):
-    """Return a lateral offset for the visual flow line.
-
-    flow_layout="center": draw both directions in the middle of the road pipe.
-    flow_layout="right_left": vehicles entering center use the right side of
-    their movement direction, vehicles leaving center use the left side. This is
-    only a visualization convention and can be unstable when the observed event
-    direction itself is uncertain.
-    """
-    if flow_layout == "center":
-        return 0.0
-    if flow_layout == "right_left":
-        return 0.34 * lane_px if direction == "in" else -0.34 * lane_px
-    return 0.0
-
-
-def draw_center_grid(frame, args, warnings):
-    cell = int(args.cell_px)
-    side = int(args.center_size * cell)
-    x0 = CENTER[0] - side // 2
-    y0 = CENTER[1] - side // 2
-    x1 = x0 + side
-    y1 = y0 + side
-
-    cv2.rectangle(frame, (x0, y0), (x1, y1), CENTER_COLOR, -1, cv2.LINE_AA)
-    cv2.rectangle(frame, (x0, y0), (x1, y1), ROAD_EDGE, 2, cv2.LINE_AA)
-
-    if any(w.get("type") == "center_density" and w.get("level") == "critical" for w in warnings):
-        cv2.rectangle(frame, (x0 - 4, y0 - 4), (x1 + 4, y1 + 4), COLLISION_COLOR, 4, cv2.LINE_AA)
-
-    cv2.putText(frame, f"CENTER size={args.center_size:g}", (x0 + 8, y0 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.48, TEXT, 1, cv2.LINE_AA)
-
-
-def _center_anchor(branch, args):
-    """Lane-specific connection point on the edge of the center square."""
-    side = int(args.center_size * args.cell_px)
+def draw_base(frame, args):
+    frame[:] = BG
+    side = center_side(args)
     half = side // 2
-    offset = int(min(max(args.cell_px * 0.42, 12), max(half * 0.55, 12)))
-    cx, cy = CENTER
-    if branch == "t1":
-        return (cx - offset, cy - half)
-    if branch == "t2":
-        return (cx + offset, cy - half)
-    if branch == "r1":
-        return (cx + half, cy - offset)
-    if branch == "r2":
-        return (cx + half, cy + offset)
-    if branch == "b1":
-        return (cx + offset, cy + half)
-    if branch == "b2":
-        return (cx - offset, cy + half)
-    if branch == "l1":
-        return (cx - half, cy + offset)
-    if branch == "l2":
-        return (cx - half, cy - offset)
-    return CENTER
+    road_thick = int(args.road_width * args.cell_px)
+    points = lane_points(args)
+
+    # Vẽ mỗi làn như một dải đường thật.
+    for lane in LANES:
+        outer, anchor = points[lane]
+        cv2.line(frame, outer, anchor, ROAD, road_thick, cv2.LINE_AA)
+        cv2.line(frame, outer, anchor, ROAD_EDGE, 2, cv2.LINE_AA)
+
+    # Vùng center là ô vuông trơn, không vẽ lưới 3x3.
+    x1, y1 = CENTER[0] - half, CENTER[1] - half
+    x2, y2 = CENTER[0] + half, CENTER[1] + half
+    cv2.rectangle(frame, (x1, y1), (x2, y2), CENTER_FILL, -1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), CENTER_EDGE, 2, cv2.LINE_AA)
+
+    # Nhãn làn.
+    for lane, (outer, anchor) in points.items():
+        label = REGION_LABELS[lane]
+        p = point_on_segment(outer, anchor, 0.18)
+        color = LANE_COLORS.get(lane, TEXT)
+        draw_text(frame, label, (p[0] - 28, p[1] + 5), 0.44, color, 1)
+    draw_text(frame, "CENTER", (CENTER[0] - 36, CENTER[1] + 5), 0.52, TEXT, 1)
 
 
-def draw_base(frame, args, warnings):
-    road_px = int(args.road_width * args.cell_px)
-    for branch in ROAD_BRANCHES:
-        p1, p2 = NODE_POS[branch], _center_anchor(branch, args)
-        cv2.line(frame, p1, p2, ROAD_COLOR, road_px, cv2.LINE_AA)
-        cv2.line(frame, p1, p2, ROAD_EDGE, 2, cv2.LINE_AA)
-
-    draw_center_grid(frame, args, warnings)
-
-    label_offsets = {
-        "t1": (-44, -24), "t2": (8, -24),
-        "r1": (-78, -18), "r2": (-78, 24),
-        "b1": (8, 42), "b2": (-58, 42),
-        "l1": (10, 28), "l2": (10, -20),
-    }
-    for name in ROAD_BRANCHES:
-        pos = NODE_POS[name]
-        dx, dy = label_offsets.get(name, (0, 0))
-        cv2.putText(frame, LANE_LABELS.get(name, name.upper()), (pos[0] + dx, pos[1] + dy), cv2.FONT_HERSHEY_SIMPLEX, 0.50, TEXT, 1, cv2.LINE_AA)
-
-
-def flow_color(edge_data, args):
-    source = edge_data.get("source", "unknown")
-    width_units = edge_data.get("width_units", 0.0)
-    if width_units >= args.road_width:
+def flow_color(item):
+    if item.get("width_units", 0) >= 3.0:
         return FLOW_CRITICAL
-    if width_units >= args.road_width * args.flow_warning_ratio:
-        return FLOW_WARNING
-    return SOURCE_COLOR.get(source, FLOW_UNKNOWN)
+    if not item.get("valid", True):
+        return UNEXPECTED
+    sources = item.get("sources", {})
+    if sources and sources.get("unknown", 0):
+        return FLOW_UNKNOWN
+    if sources and sources.get("inferred", 0):
+        return FLOW_INFERRED
+    return FLOW_OK
 
 
-def draw_flow_edge(frame, branch, direction, edge_data, sim_time, args):
-    if not edge_data or edge_data.get("pce_per_s", 0.0) <= 0:
+def draw_polyline(frame, pts: List[Tuple[int, int]], color, thickness):
+    if len(pts) < 2:
         return
-
-    anchor = _center_anchor(branch, args)
-    if direction == "in":
-        p1, p2 = NODE_POS[branch], anchor
-    else:
-        p1, p2 = anchor, NODE_POS[branch]
-
-    offset = _direction_offset(branch, direction, args.cell_px, args.flow_layout)
-    p1, p2 = _offset_points(p1, p2, offset)
-
-    width_units = edge_data.get("width_units", 0.0)
-    visible_units = min(width_units, args.road_width)
-    thickness = max(2, int(visible_units * args.cell_px))
-    color = flow_color(edge_data, args)
-
-    cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
-    if width_units >= args.road_width:
-        cv2.line(frame, p1, p2, COLLISION_COLOR, max(2, thickness + 6), cv2.LINE_AA)
-        cv2.line(frame, p1, p2, color, thickness, cv2.LINE_AA)
-
-    # White particles show continuous "always flowing" behavior. They are only
-    # visualization particles; no vehicle-level simulation is added here.
-    particle_count = max(1, min(14, int(2 + visible_units * 3)))
-    particle_speed = 0.25 + min(edge_data.get("pce_per_s", 0.0) * 0.10, 0.85)
-    for i in range(particle_count):
-        alpha = ((sim_time * particle_speed) + i / particle_count) % 1.0
-        pt = _point_on_segment(p1, p2, alpha)
-        radius = max(3, min(10, int(thickness * 0.13)))
-        cv2.circle(frame, pt, radius, (245, 245, 245), -1, cv2.LINE_AA)
-        cv2.circle(frame, pt, radius + 1, color, 1, cv2.LINE_AA)
-
-    label_pt = _point_on_segment(p1, p2, 0.55)
-    label = f"{edge_data['pce_per_s']:.2f} PCE/s | w={width_units:.2f}/{args.road_width:g}"
-    cv2.putText(frame, label, (label_pt[0] + 8, label_pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, TEXT, 1, cv2.LINE_AA)
+    for a, b in zip(pts[:-1], pts[1:]):
+        cv2.line(frame, a, b, color, thickness, cv2.LINE_AA)
 
 
-def draw_flows(frame, edges, sim_time, args):
-    for branch in ROAD_BRANCHES:
-        draw_flow_edge(frame, branch, "in", edges.get((branch, "center")), sim_time, args)
-        draw_flow_edge(frame, branch, "out", edges.get(("center", branch)), sim_time, args)
-
-
-def draw_queue_and_density(frame, states, args):
-    for branch in ROAD_BRANCHES:
-        pce = _float(states.get(branch, {}).get("queue_estimate_pce"), 0.0)
-        if pce <= 0:
+def draw_flow(frame, edges: Dict[Tuple[str, str], dict], args):
+    for edge, item in edges.items():
+        width_units = float(item.get("width_units", 0.0))
+        if width_units <= 0:
             continue
-        p1, p2 = NODE_POS[branch], _center_anchor(branch, args)
-        alpha = min(0.50, 0.08 + pce * 0.025)
-        q_end = _point_on_segment(p1, p2, alpha)
-        q_thick = max(6, min(int(args.road_width * args.cell_px), int(6 + pce * args.cell_px * 0.16)))
-        cv2.line(frame, p1, q_end, QUEUE_COLOR, q_thick, cv2.LINE_AA)
-        cv2.putText(frame, f"occ {pce:.1f}", _point_on_segment(p1, p2, 0.12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, TEXT, 1, cv2.LINE_AA)
+        pts = edge_points(edge, args)
+        max_thick = int(args.road_width * args.cell_px * 1.15)
+        thickness = max(3, min(max_thick, int(width_units * args.cell_px)))
+        color = flow_color(item)
+        draw_polyline(frame, pts, color, thickness)
+        # đầu mũi tên nhỏ ở gần cuối hướng đi
+        if len(pts) >= 2:
+            p1, p2 = pts[-2], pts[-1]
+            cv2.arrowedLine(frame, point_on_segment(p1, p2, 0.55), point_on_segment(p1, p2, 0.82), color, max(2, thickness // 8), cv2.LINE_AA, tipLength=0.28)
+            label_pos = point_on_segment(p1, p2, 0.48)
+            draw_text(frame, f"{item['pce_per_s']:.2f} PCE/s", (label_pos[0] + 6, label_pos[1] - 6), 0.40, TEXT, 1)
 
-    center_pce = _float(states.get("center", {}).get("pce_now"), 0.0)
+
+def draw_occupancy(frame, states: Dict[str, dict], args):
+    points = lane_points(args)
+    for lane in LANES:
+        pce = float_value(states.get(lane, {}).get("queue_estimate_pce"))
+        if pce <= 0.01:
+            continue
+        outer, anchor = points[lane]
+        t = min(0.55, 0.08 + pce * 0.04)
+        q_end = point_on_segment(outer, anchor, t)
+        q_thick = max(5, min(int(args.road_width * args.cell_px), int(5 + pce * args.cell_px * 0.15)))
+        cv2.line(frame, outer, q_end, QUEUE_COLOR, q_thick, cv2.LINE_AA)
+        label_at = point_on_segment(outer, anchor, min(0.35, t + 0.08))
+        draw_text(frame, f"mật độ {pce:.1f}", (label_at[0] - 22, label_at[1] - 8), 0.38, QUEUE_COLOR, 1)
+
+    center_pce = float_value(states.get("center", {}).get("pce_now"))
     capacity = max(args.center_size * args.center_size, 1e-6)
     density = center_pce / capacity
-    side = int(args.center_size * args.cell_px)
-    x0 = CENTER[0] - side // 2
-    y1 = CENTER[1] + side // 2
-    cv2.putText(frame, f"center mass={center_pce:.2f} PCE density={density:.2f}", (x0, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, TEXT, 1, cv2.LINE_AA)
+    x = CENTER[0] - center_side(args) // 2
+    y = CENTER[1] + center_side(args) // 2 + 24
+    color = FLOW_CRITICAL if density >= args.center_density_critical else (FLOW_WARNING if density >= args.center_density_warning else TEXT)
+    draw_text(frame, f"center={center_pce:.2f} PCE  mật độ={density:.2f}", (x, y), 0.47, color, 1)
 
 
-def analyze_warnings(edges, states, raw_data, sim_time, args, scenario="observed"):
+def analyze_warnings(edges: Dict[Tuple[str, str], dict], states: Dict[str, dict], events: List[Event], sim_time: float, args) -> List[dict]:
     warnings = []
-
-    # 1) Flow width overload. Width units >= road_width is the severe threshold.
-    for (a, b), data in edges.items():
-        w = data.get("width_units", 0.0)
+    for (a, b), item in edges.items():
+        w = float(item.get("width_units", 0.0))
+        if not item.get("valid", True):
+            warnings.append({"level": "cảnh báo", "type": "unexpected_edge", "edge": f"{a}->{b}", "message": f"cạnh 8 làn bất thường {a}->{b}"})
         if w >= args.road_width:
-            warnings.append({"type": "flow_width", "level": "critical", "edge": (a, b), "message": f"CRITICAL: {a}->{b} width {w:.2f} >= road width {args.road_width:g}"})
+            warnings.append({"level": "nghiêm trọng", "type": "do_rong_flow", "edge": f"{a}->{b}", "message": f"{a}->{b} rộng {w:.2f} >= đường {args.road_width:g}"})
         elif w >= args.road_width * args.flow_warning_ratio:
-            warnings.append({"type": "flow_width", "level": "warning", "edge": (a, b), "message": f"High flow: {a}->{b} width {w:.2f}/{args.road_width:g}"})
+            warnings.append({"level": "cảnh báo", "type": "do_rong_flow", "edge": f"{a}->{b}", "message": f"flow cao {a}->{b}: {w:.2f}/{args.road_width:g}"})
 
-    # 2) Center density/collision risk.
-    center_pce = _float(states.get("center", {}).get("pce_now"), 0.0)
-    center_capacity = max(args.center_size * args.center_size, 1e-6)
-    center_density = center_pce / center_capacity
-    if center_density >= args.center_density_critical:
-        warnings.append({"type": "center_density", "level": "critical", "edge": ("center", "center"), "message": f"COLLISION RISK: center density {center_density:.2f} >= {args.center_density_critical:g}"})
-    elif center_density >= args.center_density_warning:
-        warnings.append({"type": "center_density", "level": "warning", "edge": ("center", "center"), "message": f"Dense center: density {center_density:.2f}"})
+    center_pce = float_value(states.get("center", {}).get("pce_now"))
+    density = center_pce / max(args.center_size * args.center_size, 1e-6)
+    if density >= args.center_density_critical:
+        warnings.append({"level": "nghiêm trọng", "type": "center_density", "edge": "center", "message": f"mật độ center {density:.2f} nghiêm trọng"})
+    elif density >= args.center_density_warning:
+        warnings.append({"level": "cảnh báo", "type": "center_density", "edge": "center", "message": f"mật độ center {density:.2f}"})
 
-    # 3) Adjacent inflows both high -> crossing/conflict risk.
-    # This rule is only enabled in the hypothetical no-signal simulation.
-    # In observed mode, adjacent inflows are still real data, but we do not
-    # assume they must collide because a real traffic phase, priority rule, or
-    # driver behavior may have already resolved the conflict.
-    if scenario == "no_signal":
-        inflow_units = {branch: edges.get((branch, "center"), {}).get("width_units", 0.0) for branch in ROAD_BRANCHES}
-        for a, b in ADJACENT_INFLOW_PAIRS:
-            if inflow_units[a] >= args.collision_flow_width and inflow_units[b] >= args.collision_flow_width:
-                level = "critical" if center_density >= args.center_density_warning else "warning"
-                warnings.append({"type": "adjacent_inflow", "level": level, "edge": (a, b), "message": f"No-signal conflict risk: adjacent inflows {a}+{b} high ({inflow_units[a]:.2f}, {inflow_units[b]:.2f})"})
-
-    # 4) Long imbalance: inflow to center vs outflow from center over a longer window.
     if args.imbalance_seconds > 0:
-        long_events = raw_data.window(max(0.0, sim_time - args.imbalance_seconds), sim_time)
-        in_pce = sum(e["pce"] for e in long_events if e["to_region"] == "center" and e["from_region"] in ROAD_BRANCHES)
-        out_pce = sum(e["pce"] for e in long_events if e["from_region"] == "center" and e["to_region"] in ROAD_BRANCHES)
-        rate_diff = (in_pce - out_pce) / max(args.imbalance_seconds, 1e-6)
-        if abs(rate_diff) >= args.imbalance_threshold_pceps:
-            direction = "inflow > outflow" if rate_diff > 0 else "outflow > inflow"
-            prefix = "Observed" if scenario == "observed" else "No-signal"
-            warnings.append({"type": "long_imbalance", "level": "warning", "edge": ("center", "center"), "message": f"{prefix} long imbalance {direction}: {rate_diff:+.2f} PCE/s over {args.imbalance_seconds:g}s"})
-
+        win = events_in_window(events, max(0.0, sim_time - args.imbalance_seconds), sim_time)
+        in_pce = sum(e.pce for e in win if e.to_region == "center" and e.from_region in INBOUND)
+        out_pce = sum(e.pce for e in win if e.from_region == "center" and e.to_region in OUTBOUND)
+        diff = (in_pce - out_pce) / max(args.imbalance_seconds, 1e-6)
+        if abs(diff) >= args.imbalance_threshold_pceps:
+            direction = "vào > ra" if diff > 0 else "ra > vào"
+            warnings.append({"level": "cảnh báo", "type": "long_imbalance", "edge": "center", "message": f"mất cân bằng kéo dài {direction}: {diff:+.2f} PCE/s"})
     return warnings
 
 
-def _edge_label_point(edge, args, index=0):
-    """Place warning labels beside the lane/center instead of in a bottom panel."""
-    a, b = edge if edge else ("center", "center")
-    if a == "center" and b == "center":
-        return (CENTER[0] + int(args.center_size * args.cell_px * 0.65), CENTER[1] - 18 + index * 18)
-
-    if a in ROAD_BRANCHES and b == "center":
-        p1, p2 = NODE_POS[a], _center_anchor(a, args)
-    elif a == "center" and b in ROAD_BRANCHES:
-        p1, p2 = _center_anchor(b, args), NODE_POS[b]
-    elif a in ROAD_BRANCHES and b in ROAD_BRANCHES:
-        # Adjacent-inflow warning: put it near the center between the two arms.
-        p1 = _point_on_segment(NODE_POS[a], _center_anchor(a, args), 0.78)
-        p2 = _point_on_segment(NODE_POS[b], _center_anchor(b, args), 0.78)
-        return ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2 + index * 18)
-    else:
-        return (820, 690 + index * 18)
-
-    base = _point_on_segment(p1, p2, 0.70)
-    # Put label outside the pipe, not on top of the flow.
-    p_label, _ = _offset_points(base, p2, args.road_width * args.cell_px * 0.72)
-    return (p_label[0], p_label[1] + index * 18)
+def warning_label_pos(edge: str, idx: int, args):
+    if edge == "center" or "->" not in edge:
+        return CENTER[0] + center_side(args) // 2 + 14, CENTER[1] - 18 + idx * 18
+    a, b = edge.split("->", 1)
+    pts = edge_points((a, b), args)
+    if len(pts) >= 2:
+        base = point_on_segment(pts[0], pts[-1], 0.72)
+        return base[0] + 12, base[1] + idx * 18
+    return 830, 120 + idx * 18
 
 
-def draw_warnings(frame, warnings, args):
-    if not warnings:
-        return
-
-    per_edge_count = Counter()
+def draw_warnings(frame, warnings: List[dict], args):
+    counts = Counter()
     for w in warnings:
-        edge = tuple(w.get("edge", ("center", "center")))
-        idx = per_edge_count[edge]
-        per_edge_count[edge] += 1
-        x, y = _edge_label_point(edge, args, idx)
-        color = COLLISION_COLOR if w.get("level") == "critical" else FLOW_WARNING
-        short = w.get("message", "warning")
-        if len(short) > 54:
-            short = short[:51] + "..."
-        cv2.putText(frame, short, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.41, color, 1, cv2.LINE_AA)
+        edge = w.get("edge", "center")
+        idx = counts[edge]
+        counts[edge] += 1
+        x, y = warning_label_pos(edge, idx, args)
+        color = FLOW_CRITICAL if w.get("level") == "nghiêm trọng" else FLOW_WARNING
+        msg = w.get("message", "cảnh báo")
+        if len(msg) > 48:
+            msg = msg[:45] + "..."
+        draw_text(frame, msg, (x, y), 0.39, color, 1)
 
 
-def setup_warning_log(args):
+def setup_log(args):
     if args.no_warning_log:
         args._warning_log_path = ""
-        args._warning_log_seen = set()
+        args._log_seen = set()
         return
-    path = args.warning_log.strip()
-    if not path:
-        path = os.path.join(args.run_dir, "fluid_replay_warnings.log")
+    path = args.warning_log or os.path.join(args.run_dir, "fluid_replay_warnings.log")
     args._warning_log_path = path
-    args._warning_log_seen = set()
+    args._log_seen = set()
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("# Fluid flow warning log\n")
-        f.write("# overwritten on each run\n")
-        f.write("# time_s\tscenario\tlevel\ttype\tedge\tmessage\n")
+        f.write("# Cảnh báo mô phỏng flow thật 8 làn\n")
+        f.write("# file được ghi đè mỗi lần chạy\n")
+        f.write("# time_s\tmức\tloại\tcạnh\tnội_dung\n")
 
 
-def log_warnings(args, scenario, sim_time, warnings):
+def log_warnings(args, sim_time: float, warnings: List[dict]):
     path = getattr(args, "_warning_log_path", "")
-    if not path or not warnings:
+    if not path:
         return
-    interval = max(float(getattr(args, "log_interval", 1.0)), 1e-3)
-    bucket = int(sim_time / interval)
+    bucket = int(sim_time / max(args.log_interval, 1e-6))
     lines = []
-    seen = getattr(args, "_warning_log_seen", set())
     for w in warnings:
-        edge = w.get("edge", ("", ""))
-        edge_text = "->".join(edge) if isinstance(edge, (list, tuple)) else str(edge)
-        key = (scenario, bucket, w.get("level"), w.get("type"), edge_text, w.get("message"))
-        if key in seen:
+        key = (bucket, w.get("level"), w.get("type"), w.get("edge"), w.get("message"))
+        if key in args._log_seen:
             continue
-        seen.add(key)
-        lines.append(f"{sim_time:.3f}\t{scenario}\t{w.get('level','')}\t{w.get('type','')}\t{edge_text}\t{w.get('message','')}\n")
-    args._warning_log_seen = seen
+        args._log_seen.add(key)
+        lines.append(f"{sim_time:.3f}\t{w.get('level','')}\t{w.get('type','')}\t{w.get('edge','')}\t{w.get('message','')}\n")
     if lines:
         with open(path, "a", encoding="utf-8") as f:
             f.writelines(lines)
 
 
-def draw_hud(frame, sim_time, duration, args, source_path, paused, scenario="observed"):
-    title = f"Fluid Flow Replay - {SCENARIO_DISPLAY.get(scenario, scenario).replace('_', ' ')}"
-    cv2.putText(frame, title, (24, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.84, TEXT, 2, cv2.LINE_AA)
-    if scenario == "observed":
-        scenario_note = "observed real-flow baseline"
-    elif scenario == "no_signal":
-        scenario_note = "hypothetical no-signal / always-flow conflict check"
-    else:
-        scenario_note = scenario
-    cv2.putText(
-        frame,
-        f"t={sim_time:7.2f}/{duration:.2f}s | speed={args.speed:.2f}x | bin={args.bin_seconds:g}s smooth={args.smooth_seconds:g}s | {scenario_note}" + (" | PAUSED" if paused else ""),
-        (24, 62),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
-        MUTED,
-        1,
-        cv2.LINE_AA,
-    )
-    cv2.putText(frame, f"lane width={args.road_width:g} cells | center={args.center_size:g}x{args.center_size:g} cells | data={os.path.basename(source_path)}", (24, 87), cv2.FONT_HERSHEY_SIMPLEX, 0.46, MUTED, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"Pipe width = PCE/s converted to lane cells | layout={args.flow_layout}. >= road width is severe.", (24, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.44, MUTED, 1, cv2.LINE_AA)
+def draw_hud(frame, sim_time, duration, args, source_name, paused):
+    draw_text(frame, "Mô phỏng flow thật 8 làn", (24, 34), 0.82, TEXT, 2)
+    draw_text(frame, f"t={sim_time:7.2f}/{duration:.2f}s | tốc độ={args.speed:.2f}x | cửa sổ={args.window_seconds:g}s | dữ liệu={source_name}" + (" | TẠM DỪNG" if paused else ""), (24, 62), 0.47, MUTED, 1)
+    draw_text(frame, f"rộng đường={args.road_width:g} ô | center={args.center_size:g}x{args.center_size:g} ô | không nội suy, không giả định không đèn", (24, 88), 0.45, MUTED, 1)
+    draw_text(frame, "Độ rộng dòng = PCE/s thật trong cửa sổ gần nhất. >= độ rộng đường là nghiêm trọng.", (24, 113), 0.43, MUTED, 1)
 
-    x, y = 812, 34
-    legend = (("observed", FLOW_OK), ("inferred", FLOW_INFERRED), ("unknown", FLOW_UNKNOWN), ("warning", FLOW_WARNING), ("critical", FLOW_CRITICAL))
+    x, y = 840, 32
+    legend = (("quan sát", FLOW_OK), ("suy luận", FLOW_INFERRED), ("không rõ", FLOW_UNKNOWN), ("cạnh bất thường", UNEXPECTED), ("cảnh báo", FLOW_WARNING), ("nghiêm trọng", FLOW_CRITICAL))
     for i, (name, color) in enumerate(legend):
-        yy = y + i * 23
-        cv2.line(frame, (x, yy), (x + 42, yy), color, 7, cv2.LINE_AA)
-        cv2.putText(frame, name, (x + 54, yy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, TEXT, 1, cv2.LINE_AA)
+        yy = y + i * 22
+        cv2.line(frame, (x, yy), (x + 38, yy), color, 7, cv2.LINE_AA)
+        draw_text(frame, name, (x + 50, yy + 5), 0.42, TEXT, 1)
 
 
-def draw_single_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused=False, scenario="observed"):
-    states = get_state_at_time(rows_by_region, sim_time, args.interpolate_state)
-    edges = aggregate_events(raw_data, sim_time, args)
-    warnings = analyze_warnings(edges, states, raw_data, sim_time, args, scenario=scenario)
-    log_warnings(args, scenario, sim_time, warnings)
+def draw_frame(events, states_by_region, sim_time, duration, args, paused=False):
+    frame = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+    states = state_at_or_before(states_by_region, sim_time)
+    edges = aggregate_edges(events, sim_time, args)
+    warnings = analyze_warnings(edges, states, events, sim_time, args)
+    log_warnings(args, sim_time, warnings)
 
-    frame = np.zeros((CANVAS_SIZE[1], CANVAS_SIZE[0], 3), dtype=np.uint8)
-    frame[:] = BACKGROUND
-    draw_base(frame, args, warnings)
-    draw_queue_and_density(frame, states, args)
-    draw_flows(frame, edges, sim_time, args)
-    draw_hud(frame, sim_time, duration, args, source_path, paused, scenario=scenario)
+    draw_base(frame, args)
+    draw_occupancy(frame, states, args)
+    draw_flow(frame, edges, args)
     draw_warnings(frame, warnings, args)
+    draw_hud(frame, sim_time, duration, args, os.path.basename(args.run_dir), paused)
     return frame
 
 
-def draw_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused=False):
-    if args.scenario == "compare":
-        observed = draw_single_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused, scenario="observed")
-        no_signal = draw_single_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused, scenario="no_signal")
-        divider = np.full((CANVAS_SIZE[1], 6, 3), (10, 10, 12), dtype=np.uint8)
-        return cv2.hconcat([observed, divider, no_signal])
-    return draw_single_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused, scenario=args.scenario)
+# ------------------------------------ Chương trình chính -----------------------------------
 
-
-def output_size(args):
-    if args.scenario == "compare":
-        return (CANVAS_SIZE[0] * 2 + 6, CANVAS_SIZE[1])
-    return CANVAS_SIZE
-
-
-def replay_window(args, raw_data, rows_by_region, source_path, duration):
-    paused = False
-    sim_time = 0.0
-    last_wall = time.time()
-    render_delay_ms = max(1, int(1000 / max(args.fps, 1.0)))
-
-    while sim_time <= duration + 1e-6:
-        now = time.time()
-        elapsed = now - last_wall
-        last_wall = now
-        if not paused:
-            sim_time += elapsed * max(args.speed, 0.01)
-
-        frame = draw_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused)
-        cv2.imshow("Fluid Flow Replay", frame)
-        key = cv2.waitKey(render_delay_ms) & 0xFF
-        if key in (27, ord("q")):
-            break
-        if key == ord(" "):
-            paused = not paused
-        if key == ord("]"):
-            args.speed = min(args.speed * 1.25, 16.0)
-        if key == ord("["):
-            args.speed = max(args.speed / 1.25, 0.05)
-    cv2.destroyAllWindows()
-
-
-def save_video(args, raw_data, rows_by_region, source_path, duration):
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(args.save, fourcc, max(args.fps, 1.0), output_size(args))
-    if not writer.isOpened():
-        raise RuntimeError(f"Cannot open output video: {args.save}")
-
-    render_fps = max(args.fps, 1.0)
-    sim_step = max(args.speed, 0.01) / render_fps
-    sim_time = 0.0
-    while sim_time <= duration + 1e-6:
-        frame = draw_frame(raw_data, rows_by_region, source_path, sim_time, duration, args, paused=False)
-        writer.write(frame)
-        sim_time += sim_step
-    writer.release()
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mô phỏng lại dữ liệu flow_edges_real.csv 8 làn thật dưới dạng sơ đồ đường/chất lỏng.")
+    parser.add_argument("run_dir", help="thư mục flow_exports/<run_dir> chứa flow_edges_real.csv")
+    parser.add_argument("--speed", type=float, default=1.0, help="Tốc độ phát. 1.0 = thời gian thực, 0.5 = chậm một nửa.")
+    parser.add_argument("--fps", type=float, default=30.0, help="FPS hiển thị/video.")
+    parser.add_argument("--window-seconds", "--bin-seconds", dest="window_seconds", type=float, default=1.0, help="Cửa sổ gom dữ liệu thật gần nhất, tính bằng giây.")
+    parser.add_argument("--road-width", type=float, default=3.0, help="Độ rộng sức chứa hiển thị của đường/làn, tính theo đơn vị ô làn.")
+    parser.add_argument("--center-size", type=float, default=3.0, help="Kích thước ô center theo đơn vị ô làn. 3 nghĩa là 3x3.")
+    parser.add_argument("--cell-px", type=float, default=42.0, help="Số pixel cho mỗi đơn vị ô làn.")
+    parser.add_argument("--lane-capacity-pceps", type=float, default=1.0, help="PCE/s tương ứng với một ô độ rộng flow.")
+    parser.add_argument("--flow-warning-ratio", type=float, default=0.75, help="Cảnh báo khi độ rộng flow đạt tỉ lệ này so với độ rộng đường.")
+    parser.add_argument("--center-density-warning", type=float, default=0.65)
+    parser.add_argument("--center-density-critical", type=float, default=0.95)
+    parser.add_argument("--imbalance-seconds", type=float, default=20.0)
+    parser.add_argument("--imbalance-threshold-pceps", type=float, default=0.8)
+    parser.add_argument("--valid-edges-only", action="store_true", help="Ẩn các chuyển vùng thật nhưng không chuẩn như center->làn vào hoặc làn ra->center.")
+    parser.add_argument("--start-time", type=float, default=0.0)
+    parser.add_argument("--end-time", type=float, default=None)
+    parser.add_argument("--save", default="", help="Đường dẫn .mp4 đầu ra nếu muốn lưu video.")
+    parser.add_argument("--no-window", action="store_true", help="Không mở cửa sổ hiển thị OpenCV.")
+    parser.add_argument("--warning-log", default="", help="Đường dẫn file log cảnh báo. Mặc định: <run_dir>/fluid_replay_warnings.log")
+    parser.add_argument("--no-warning-log", action="store_true")
+    parser.add_argument("--log-interval", type=float, default=1.0)
+    return parser.parse_args()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fluid-like replay using real edge flow events.")
-    parser.add_argument("run_dir", help="Directory containing flow_edges_real.csv")
-    parser.add_argument("--save", default="", help="Optional output .mp4 path")
-    parser.add_argument("--scenario", choices=SCENARIO_CHOICES, default="observed", help="observed = real-flow baseline, no_signal = hypothetical always-flow conflict check, compare = side-by-side")
-    parser.add_argument("--fps", type=float, default=30.0, help="Render FPS for window/video")
-    parser.add_argument("--speed", type=float, default=1.0, help="Simulation speed. 1.0 = real time, 0.25 = 4x slower")
-    parser.add_argument("--bin-seconds", type=float, default=1.0, help="Runtime aggregation window in seconds")
-    parser.add_argument("--smooth-seconds", type=float, default=0.0, help="Runtime smoothing window. 0 = use only bin-seconds")
-    parser.add_argument("--road-width", type=float, default=3.0, help="Road width in car/lane cells. Default 3")
-    parser.add_argument("--center-size", type=float, default=3.0, help="Center square side in car cells. Default 3 means 3x3")
-    parser.add_argument("--cell-px", type=float, default=42.0, help="Pixels per road/center cell")
-    parser.add_argument("--flow-layout", choices=("center", "right_left"), default="center", help="Flow drawing layout. center = one line in the middle of each road. right_left = entering center on right side, exiting on left side.")
-    parser.add_argument("--lane-capacity-pceps", type=float, default=1.0, help="PCE/s represented by one width cell")
-    parser.add_argument("--flow-warning-ratio", type=float, default=0.75, help="Warn when flow width exceeds this fraction of road width")
-    parser.add_argument("--center-density-warning", type=float, default=0.65, help="Warn when center PCE/(center_size^2) exceeds this")
-    parser.add_argument("--center-density-critical", type=float, default=0.90, help="Critical collision risk density threshold")
-    parser.add_argument("--collision-flow-width", type=float, default=1.0, help="Adjacent inflow conflict threshold in width cells")
-    parser.add_argument("--imbalance-seconds", type=float, default=20.0, help="Long-window imbalance check duration")
-    parser.add_argument("--imbalance-threshold-pceps", type=float, default=0.8, help="Warn if |inflow-outflow| exceeds this PCE/s over imbalance window")
-    parser.add_argument("--interpolate-state", action="store_true", help="Interpolate region_state_timeseries.csv at runtime")
-    parser.add_argument("--warning-log", default="", help="Warning .log output path. Default: <run_dir>/fluid_replay_warnings.log")
-    parser.add_argument("--log-interval", type=float, default=1.0, help="Minimum seconds between repeated warning log entries")
-    parser.add_argument("--no-warning-log", action="store_true", help="Disable warning log output")
-    parser.add_argument("--no-window", action="store_true")
-    args = parser.parse_args()
+    args = parse_args()
+    args.run_dir = os.path.abspath(args.run_dir)
+    args.window_seconds = max(args.window_seconds, 1e-3)
+    args.fps = max(args.fps, 1.0)
+    args.speed = max(args.speed, 1e-6)
 
-    setup_warning_log(args)
+    events = load_events(args.run_dir, args)
+    states_by_region = load_state_rows(args.run_dir)
 
-    raw_data, source_path = read_raw_edges(args.run_dir)
-    _, rows_by_region = read_region_states(args.run_dir)
-    if not raw_data.events:
-        raise RuntimeError("No raw edge events found in flow_edges_real.csv/region_transitions.csv")
+    if not events:
+        raise RuntimeError("Không tìm thấy event hợp lệ trong flow_edges_real.csv")
 
-    duration = raw_data.duration
+    duration = max(e.time_s for e in events)
+    for rows in states_by_region.values():
+        if rows:
+            duration = max(duration, max(r["time_s"] for r in rows))
+    if args.end_time is not None:
+        duration = min(duration, args.end_time)
+
+    setup_log(args)
+
+    writer = None
     if args.save:
-        save_video(args, raw_data, rows_by_region, source_path, duration)
-        print(f"Saved fluid replay to {args.save}")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.save, fourcc, args.fps, (CANVAS_W, CANVAS_H))
+        if not writer.isOpened():
+            raise RuntimeError(f"Không thể mở bộ ghi video: {args.save}")
 
+    window_name = "Mô phỏng flow thật 8 làn"
     if not args.no_window:
-        replay_window(args, raw_data, rows_by_region, source_path, duration)
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    sim_time = max(0.0, args.start_time)
+    paused = False
+    frame_dt = 1.0 / args.fps
+    last_wall = time.time()
+
+    try:
+        while sim_time <= duration:
+            now = time.time()
+            elapsed = now - last_wall
+            last_wall = now
+            if not paused:
+                sim_time += elapsed * args.speed
+
+            frame = draw_frame(events, states_by_region, sim_time, duration, args, paused)
+            if writer is not None:
+                writer.write(frame)
+
+            if not args.no_window:
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(max(1, int(1000 / args.fps))) & 0xFF
+                if key == ord("q") or key == 27:
+                    break
+                if key == ord(" "):
+                    paused = not paused
+                if key == ord("r"):
+                    sim_time = max(0.0, args.start_time)
+            else:
+                time.sleep(frame_dt)
+    finally:
+        if writer is not None:
+            writer.release()
+        if not args.no_window:
+            cv2.destroyAllWindows()
+
+    log_path = getattr(args, "_warning_log_path", "")
+    if log_path:
+        print(f"Log cảnh báo: {log_path}")
 
 
 if __name__ == "__main__":
