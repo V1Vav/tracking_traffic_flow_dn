@@ -38,13 +38,13 @@ REGION_COLORS = {
     "outside": (120, 128, 140),
 }
 REGION_LABELS = {
-    "t1": "T1 VÀO",
+    "t1": "T1 VAO",
     "t2": "T2 RA",
-    "l1": "L1 VÀO",
+    "l1": "L1 VAO",
     "l2": "L2 RA",
-    "r1": "R1 VÀO",
+    "r1": "R1 VAO",
     "r2": "R2 RA",
-    "b1": "B1 VÀO",
+    "b1": "B1 VAO",
     "b2": "B2 RA",
     "center": "CENTER",
     "outside": "NGOÀI",

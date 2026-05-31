@@ -784,12 +784,10 @@ def _export_track_transition(exporter, *, meta, track_id, frame_id, current_time
 
 
 def process_video(app, video_path, model_path):
-    """
-    Process a video/live source in a background thread.
+    """Xử lý video/stream trong worker nền hoặc trong chế độ headless.
 
-    For file input, playback is limited to the source FPS.
-    For webcam/RTSP/HTTP input, old frames are dropped when processing is slow so
-    the display stays close to real time.
+    Với GUI, worker cập nhật ảnh preview và chỉ số realtime.
+    Với headless, worker bỏ toàn bộ preview, mặc định không bỏ frame và xuất flow CSV.
     """
     reader_thread = None
     display_thread = None
@@ -797,6 +795,8 @@ def process_video(app, video_path, model_path):
     cap = None
     exporter = None
     try:
+        headless_mode = bool(getattr(app, "headless", False))
+        last_headless_progress_print = 0.0
         performance_profile, performance_cfg = _get_performance_cfg(app)
         cpu_threads = _configure_runtime(performance_cfg)
         model_imgsz = int(performance_cfg.get("model_imgsz", MODEL_IMGSZ))
@@ -809,6 +809,13 @@ def process_video(app, video_path, model_path):
         display_width = max(1, int(performance_cfg.get("display_width", 880)))
         display_height = max(1, int(performance_cfg.get("display_height", 620)))
         async_display = bool(performance_cfg.get("async_display", ASYNC_DISPLAY_CONVERSION))
+
+        if headless_mode:
+            # Chế độ headless chỉ xuất CSV, không tạo ảnh preview để tránh tốn CPU/RAM.
+            async_display = False
+            display_every_n = 10**9
+            display_width = 0
+            display_height = 0
 
         if async_display:
             display_queue = Queue(maxsize=max(1, int(performance_cfg.get("display_queue_size", DISPLAY_CONVERSION_QUEUE_SIZE))))
@@ -985,6 +992,10 @@ def process_video(app, video_path, model_path):
                 region_state_sample_seconds=getattr(app, "region_state_sample_seconds", 1.0),
                 hidden_left_enabled=bool(app.infer_hidden_left_var.get()),
             )
+            try:
+                app.export_output_dir = exporter.output_dir
+            except Exception:
+                pass
             with app.state_lock:
                 app.worker_state["status"] = f"Đang xuất flow vào {exporter.output_dir}"
 
@@ -1397,17 +1408,20 @@ def process_video(app, video_path, model_path):
                     total_in_count += branch_count_total[(branch, "in")]
 
             realtime_ratio = fps / target_process_fps if target_process_fps > 0 else 0.0
+            source_label = "trực tiếp" if realtime_source else "file"
+            downsample_label = f", src_fps={fps_input:.1f}->proc_fps={target_process_fps:.1f}"
+            display_label = "headless" if headless_mode else f"hiển_thị/{display_every_n}"
+            status_text = (
+                f"Đang chạy ({source_label}, {performance_profile}, {device}, "
+                f"{realtime_ratio:.2f}x tốc_độ_xử_lý{downsample_label}, detect/{detect_interval}, "
+                f"{display_label}, max_det={max_det}, "
+                f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
+            )
+
             with app.state_lock:
                 if pil_image is not None:
                     app.latest_pil_image = pil_image
-                source_label = "trực tiếp" if realtime_source else "file"
-                downsample_label = f", src_fps={fps_input:.1f}->proc_fps={target_process_fps:.1f}"
-                app.worker_state["status"] = (
-                    f"Đang chạy ({source_label}, {performance_profile}, {device}, "
-                    f"{realtime_ratio:.2f}x tốc_độ_xử_lý{downsample_label}, detect/{detect_interval}, "
-                    f"hiển_thị/{display_every_n}, max_det={max_det}, "
-                    f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
-                )
+                app.worker_state["status"] = status_text
                 app.worker_state["frame"] = f"{frame_id}/{source_frame_id}"
                 app.worker_state["fps"] = f"{fps:.1f}"
                 app.worker_state["active_tracks"] = str(active_tracks)
@@ -1415,7 +1429,19 @@ def process_video(app, video_path, model_path):
                 app.worker_state["flow_veh_pm"] = str(total_in_count)
                 app.worker_state.update(metric_updates)
 
-            if (not realtime_source) and (not drop_frames_when_slow):
+            if headless_mode:
+                now_print = time.time()
+                progress_interval = float(getattr(app, "headless_progress_interval", 10.0) or 10.0)
+                if now_print - last_headless_progress_print >= progress_interval:
+                    last_headless_progress_print = now_print
+                    print(
+                        f"[HEADLESS] video_t={current_time:9.1f}s "
+                        f"frame={frame_id}/{source_frame_id} fps={fps:5.1f} "
+                        f"tracks={active_tracks:3d} pce={total_current_pce:5.1f} "
+                        f"total_in={total_in_count} export={getattr(app, 'export_output_dir', '') or '-'}"
+                    )
+
+            if (not realtime_source) and (not drop_frames_when_slow) and (not headless_mode):
                 # Chế độ quality/offline giữ mọi frame đã lấy mẫu và căn replay
                 # trong worker. Chế độ file realtime được reader điều tiết,
                 # nên khi xử lý chậm sẽ bỏ frame cũ thay vì tích lũy độ trễ.

@@ -203,7 +203,7 @@ class FlowApp:
             "motorcycle": "Xe máy",
         }
         
-        direction_names = {"In": "Vào", "Out": "Ra", "in": "Vào", "out": "Ra"}
+        direction_names = {"In": "Vao", "Out": "Ra", "in": "Vao", "out": "Ra"}
         return f"{short_names.get(class_name, class_name.title())} {direction_names.get(direction, direction)}"
 
     def _build_ui(self):
