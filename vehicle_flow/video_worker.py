@@ -1,5 +1,6 @@
-"""Video processing worker for YOLO detection, DeepSORT tracking, and metric updates."""
+"""Worker xử lý video cho YOLO detection, DeepSORT tracking và cập nhật chỉ số."""
 
+import os
 import threading
 import time
 from collections import Counter, deque
@@ -11,7 +12,7 @@ from PIL import Image
 
 try:
     import torch
-except Exception:  # pragma: no cover - torch is normally installed with ultralytics
+except Exception:  # pragma: no cover - torch thường được cài cùng ultralytics
     torch = None
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics.models import YOLO
@@ -23,10 +24,14 @@ from .config import (
     CLASS_CONF_THRESHOLDS,
     CLASS_NAMES,
     CLASS_WEIGHTS,
+    ASYNC_DISPLAY_CONVERSION,
+    CPU_THREAD_COUNT,
     COUNTED_CLASS_IDS,
     DETECT_CLASS_IDS,
     CV2_NUM_THREADS,
     DEBUG_TRACK_LOGS,
+    DISPLAY_CONVERSION_QUEUE_SIZE,
+    ENABLE_SOURCE_FPS_DOWNSAMPLE,
     EDGE_LOST_OUT_FRAMES,
     FRAME_EXIT_MARGIN_RATIO,
     HIDDEN_LEFT_INBOUND_REGION,
@@ -59,6 +64,9 @@ from .config import (
     TRACK_N_INIT,
     TRACK_NN_BUDGET,
     TRACK_STALE_MERGE_FRAMES,
+    TORCH_INTEROP_THREADS,
+    TARGET_PROCESS_FPS,
+    USE_CPU_THREADS,
     VALID_BRANCHES,
     YOLO_WARMUP,
 )
@@ -83,7 +91,7 @@ def _normalize_model_names(names):
 
 
 def _validate_model_class_mapping(model):
-    """Warn early if the fine-tuned model class order differs from config.py."""
+    """Cảnh báo sớm nếu thứ tự class của model fine-tune khác config.py."""
     model_names = _normalize_model_names(getattr(model, "names", {}))
     expected = {idx: name.lower() for idx, name in EXPECTED_MODEL_NAMES.items()}
     mismatches = []
@@ -91,13 +99,13 @@ def _validate_model_class_mapping(model):
     for idx, expected_name in expected.items():
         actual_name = model_names.get(idx)
         if actual_name != expected_name:
-            mismatches.append(f"id {idx}: expected={expected_name}, actual={actual_name}")
+            mismatches.append(f"id {idx}: kỳ_vọng={expected_name}, thực_tế={actual_name}")
 
     return mismatches
 
 
 def _is_realtime_source(source):
-    """Return True for webcam indexes and common live stream URLs."""
+    """Trả về True với chỉ số webcam và URL stream phổ biến."""
     source_text = str(source).strip()
     if source_text.isdigit():
         return True
@@ -105,16 +113,54 @@ def _is_realtime_source(source):
 
 
 def _open_capture(source):
-    """Open file, webcam index, or stream URL with OpenCV."""
+    """Mở file, chỉ số webcam hoặc URL stream bằng OpenCV."""
     source_text = str(source).strip()
     if source_text.isdigit():
         return cv2.VideoCapture(int(source_text))
     return cv2.VideoCapture(source_text)
 
 
-def _put_frame(frame_queue, frame, realtime_source, stop_event):
-    """Put frame into queue. In real-time mode, drop old frames to reduce lag."""
-    if not realtime_source:
+def _sanitize_capture_fps(raw_fps, fallback=30.0):
+    """Trả về giá trị FPS dùng được từ metadata OpenCV.
+
+    Một số camera/codec báo 0, 1000 hoặc giá trị không thực tế. Với file video
+    bình thường, vẫn giữ FPS cao nhưng hợp lệ như 60/120 để bộ giảm FPS có thể
+    đưa về đúng FPS xử lý mục tiêu.
+    """
+    try:
+        fps = float(raw_fps or 0.0)
+    except Exception:
+        fps = 0.0
+
+    if fps < 1.0 or fps > 1000.0:
+        return float(fallback), False
+    return fps, True
+
+
+def _resolve_target_process_fps(source_fps, performance_cfg=None):
+    """Xác định FPS đưa vào YOLO/DeepSORT sau khi giảm FPS nguồn."""
+    cfg = performance_cfg or {}
+    try:
+        requested = float(cfg.get("target_process_fps", TARGET_PROCESS_FPS))
+    except Exception:
+        requested = float(TARGET_PROCESS_FPS)
+
+    if (not ENABLE_SOURCE_FPS_DOWNSAMPLE) or requested <= 0:
+        return float(source_fps), False
+
+    effective = min(float(source_fps), requested)
+    enabled = effective < float(source_fps) - 0.01
+    return max(1.0, effective), enabled
+
+
+def _put_frame(frame_queue, frame, drop_old_frames, stop_event):
+    """Đưa một frame vào hàng đợi xử lý.
+
+    Khi drop_old_frames=True, queue hoạt động như bộ đệm frame mới nhất:
+    frame cũ bị bỏ thay vì tích lũy độ trễ. Dùng cho nguồn live và replay file
+    theo thời gian thực.
+    """
+    if not drop_old_frames:
         while not stop_event.is_set():
             try:
                 frame_queue.put(frame, timeout=0.1)
@@ -123,7 +169,6 @@ def _put_frame(frame_queue, frame, realtime_source, stop_event):
                 continue
         return
 
-    # Live camera/RTSP should prefer low latency over processing every frame.
     while not stop_event.is_set():
         try:
             frame_queue.put_nowait(frame)
@@ -134,9 +179,8 @@ def _put_frame(frame_queue, frame, realtime_source, stop_event):
             except Empty:
                 pass
 
-
 def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height):
-    """Class-specific confidence + loose geometry filters for stable detection."""
+    """Lọc theo confidence riêng từng class và hình học tương đối để detection ổn định."""
     if cls not in DETECT_CLASS_IDS:
         return False
 
@@ -194,7 +238,7 @@ def _iou(a, b):
 
 
 def _containment(a, b):
-    """Intersection over the smaller box area."""
+    """Phần giao nhau chia cho diện tích box nhỏ hơn."""
     inter = _intersection_area(a, b)
     smaller = max(min(_area(a), _area(b)), 1)
     return inter / smaller
@@ -227,8 +271,8 @@ def _boxes_look_duplicate(
     if _containment(box_a, box_b) >= containment_threshold:
         return True
 
-    # Avoid removing two adjacent vehicles: require some overlap before using
-    # center distance as an additional duplicate cue.
+    # Tránh xóa nhầm hai xe sát nhau: yêu cầu có một phần chồng lấn trước khi dùng
+    # khoảng cách tâm làm tín hiệu trùng bổ sung.
     if iou_value >= 0.12 and _center_distance_ratio(box_a, box_b) <= center_ratio_threshold:
         return True
 
@@ -236,11 +280,11 @@ def _boxes_look_duplicate(
 
 
 def _detections_can_suppress(det_a, det_b):
-    """Return True when duplicate suppression may remove one detection.
+    """Trả về True khi bước khử trùng có thể xóa một detection.
 
-    Keep person-vs-vehicle overlaps because a rider/person box can legitimately
-    overlap a motorbike/car box. Vehicle-vs-vehicle remains class-agnostic to
-    collapse class flicker duplicates such as car/motorbike on the same object.
+    Giữ chồng lấn person-vs-vehicle vì box người/người lái có thể hợp lệ khi
+    chồng lên box xe máy/ô tô. Vehicle-vs-vehicle vẫn không phụ thuộc class để
+    gộp các box trùng do class nhảy như car/motorbike trên cùng object.
     """
     cls_a = int(det_a[2])
     cls_b = int(det_b[2])
@@ -252,17 +296,17 @@ def _detections_can_suppress(det_a, det_b):
 
 
 def _suppress_duplicate_detections(detections):
-    """Duplicate suppression before DeepSORT.
+    """Khử detection trùng trước DeepSORT.
 
-    Counted vehicles are suppressed class-agnostically to avoid one vehicle
-    becoming several IDs. Person detections are kept separate from vehicles so
-    they can still be displayed without affecting vehicle tracking/counting.
+    Các phương tiện được đếm sẽ được khử trùng không phụ thuộc class để tránh
+    một xe thành nhiều ID. Detection person được giữ riêng với vehicle để vẫn
+    hiển thị được mà không ảnh hưởng tracking/counting phương tiện.
     """
     if len(detections) <= 1:
         return detections
 
-    # Keep high-confidence detections first. For equal confidence, prefer the
-    # smaller/tighter box because it is less likely to cover multiple vehicles.
+    # Giữ detection confidence cao trước. Nếu confidence bằng nhau, ưu tiên
+    # box nhỏ/gọn hơn vì ít khả năng bao nhiều xe cùng lúc.
     sorted_dets = sorted(
         detections,
         key=lambda det: (float(det[1]), -_area(_xywh_to_ltrb(det[0]))),
@@ -293,9 +337,9 @@ def _suppress_duplicate_detections(detections):
 
 
 def _track_is_usable(track):
-    # DeepSORT can internally keep tracks for a long time, but drawing/counting
-    # stale boxes causes the exact symptom in the screenshot: many IDs remain
-    # around the same vehicle. Only fresh tracks are used for display/counting.
+    # DeepSORT có thể giữ track nội bộ rất lâu, nhưng vẽ/đếm
+    # box cũ sẽ gây đúng hiện tượng trong ảnh: nhiều ID còn nằm
+    # quanh cùng một xe. Chỉ track mới được dùng để hiển thị/đếm.
     return track.is_confirmed() and track.time_since_update <= TRACK_DISPLAY_MAX_AGE
 
 
@@ -305,7 +349,7 @@ def _track_ltrb(track):
 
 
 def _box_near_frame_edge(box, frame_width, frame_height):
-    """Return True when the last known box is close to leaving the camera view."""
+    """Trả về True nếu box gần nhất sắp rời khỏi vùng camera."""
     if box is None:
         return False
     x1, y1, x2, y2 = box
@@ -329,11 +373,11 @@ def _emit_active_branch_out(
     branch_class_count_total,
     branch_event_windows,
 ):
-    """Close one active branch visit if its IN event was counted.
+    """Đóng một lượt branch đang hoạt động nếu event IN đã được đếm.
 
-    This keeps IN/OUT paired per track visit without forcing OUT at the same
-    time as IN. It also uses the class saved at IN time, so class smoothing
-    changes after entry cannot turn a Moto In into a Car Out.
+    Cách này giữ IN/OUT theo từng lượt track mà không ép OUT xảy ra cùng lúc
+    với IN. Nó cũng dùng class đã lưu tại thời điểm IN, nên việc làm mượt class
+    sau khi vào vùng không thể biến Moto In thành Car Out.
     """
     active_branch = meta.get("active_branch")
     if active_branch not in valid_branches:
@@ -409,7 +453,7 @@ def _track_sort_key(track, track_meta):
 
 
 def _suppress_duplicate_tracks(tracks, track_meta):
-    """Return primary fresh tracks and duplicate track ids to ignore/delete."""
+    """Trả về các track chính còn mới và ID track trùng cần bỏ qua/xóa."""
     fresh_tracks = [track for track in tracks if _track_is_usable(track)]
     if len(fresh_tracks) <= 1:
         return fresh_tracks, set()
@@ -442,11 +486,11 @@ def _suppress_duplicate_tracks(tracks, track_meta):
 
 
 def _merge_stale_duplicate_meta(track_meta, primary_tracks, frame_id):
-    """Move old metadata to a new ID when DeepSORT switches ID on one vehicle.
+    """Chuyển metadata cũ sang ID mới khi DeepSORT đổi ID trên cùng một xe.
 
-    This does not change DeepSORT's internal id, but it preserves stable class,
-    active branch and cooldown state, so one physical vehicle is less likely to
-    be counted again after an ID switch.
+    Việc này không đổi ID nội bộ của DeepSORT, nhưng giữ lại class ổn định,
+    branch đang hoạt động và trạng thái cooldown, nhờ đó một xe thật ít bị
+    đếm lại sau khi bị đổi ID.
     """
     primary_ids = {track.track_id for track in primary_tracks}
 
@@ -494,11 +538,11 @@ def _merge_stale_duplicate_meta(track_meta, primary_tracks, frame_id):
 
 
 def _near_hidden_left_gate(centroid, frame_width, app):
-    """Heuristic gate for the hidden/occluded left branch.
+    """Cổng heuristic cho nhánh trái bị khuất/che.
 
-    If a track appears or disappears in the center close to this x threshold,
-    the exporter can create an inferred left<->center flow edge. This does not
-    modify the real tracking/counting logic.
+    Nếu track xuất hiện hoặc biến mất trong center gần ngưỡng x này,
+    exporter có thể tạo cạnh flow suy luận left<->center. Việc này không
+    thay đổi logic tracking/counting thật.
     """
     if centroid is None or frame_width <= 0:
         return False
@@ -531,7 +575,7 @@ def _fluid_export_enabled(app):
 
 
 def _get_performance_cfg(app):
-    """Resolve the selected performance preset without changing UI state."""
+    """Xác định preset hiệu năng đã chọn mà không đổi trạng thái UI."""
     profile = str(getattr(app, "performance_profile", DEFAULT_PERFORMANCE_PROFILE)).strip().lower()
     if profile not in PERFORMANCE_PROFILES:
         profile = DEFAULT_PERFORMANCE_PROFILE
@@ -542,11 +586,40 @@ def _get_performance_cfg(app):
     return profile, cfg
 
 
-def _configure_runtime():
-    """Small runtime setup that can improve GPU/CV throughput without changing logic."""
-    if CV2_NUM_THREADS and CV2_NUM_THREADS > 0:
+def _resolve_cpu_thread_count(performance_cfg=None):
+    """Trả về số luồng CPU dùng cho OpenCV/PyTorch CPU."""
+    if not USE_CPU_THREADS:
+        return 0
+
+    cfg = performance_cfg or {}
+    raw_value = cfg.get("cpu_thread_count", CPU_THREAD_COUNT)
+    try:
+        requested = int(raw_value)
+    except Exception:
+        requested = 0
+
+    total_cores = os.cpu_count() or 4
+    if requested <= 0:
+        # Chừa tài nguyên cho UI Tkinter, hệ điều hành, đọc video và lịch GPU driver.
+        requested = max(1, total_cores - 2)
+
+    return max(1, min(requested, total_cores))
+
+
+def _configure_runtime(performance_cfg=None):
+    """Thiết lập runtime cho xử lý CPU đa lõi và thông lượng GPU/CV."""
+    try:
+        cv2.setUseOptimized(True)
+    except Exception:
+        pass
+
+    cpu_threads = _resolve_cpu_thread_count(performance_cfg)
+
+    # OpenCV dùng giá trị này cho decode/resize/chuyển màu/vẽ nếu được hỗ trợ.
+    opencv_threads = int(CV2_NUM_THREADS) if CV2_NUM_THREADS and CV2_NUM_THREADS > 0 else cpu_threads
+    if opencv_threads > 0:
         try:
-            cv2.setNumThreads(int(CV2_NUM_THREADS))
+            cv2.setNumThreads(int(opencv_threads))
         except Exception:
             pass
 
@@ -555,6 +628,66 @@ def _configure_runtime():
             torch.backends.cudnn.benchmark = True
         except Exception:
             pass
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+        # Nếu YOLO fallback sang CPU, thiết lập này cho phép PyTorch dùng nhiều core.
+        # Khi chạy CUDA, nó vẫn hỗ trợ một số bước tiền/hậu xử lý trên CPU.
+        if cpu_threads > 0:
+            try:
+                torch.set_num_threads(int(cpu_threads))
+            except Exception:
+                pass
+            try:
+                torch.set_num_interop_threads(max(1, min(int(TORCH_INTEROP_THREADS), int(cpu_threads))))
+            except Exception:
+                # PyTorch có thể từ chối đổi interop sau khi đã bắt đầu xử lý song song.
+                pass
+
+    return cpu_threads
+
+
+def _put_display_frame(display_queue, display_frame, display_width, display_height, stop_event):
+    """Gửi frame hiển thị sang luồng chuyển đổi và bỏ frame preview cũ."""
+    if display_queue is None or display_frame is None:
+        return False
+
+    item = (display_frame, int(display_width), int(display_height))
+    while not stop_event.is_set():
+        try:
+            display_queue.put_nowait(item)
+            return True
+        except Full:
+            try:
+                display_queue.get_nowait()
+            except Empty:
+                pass
+    return False
+
+
+def _display_converter_worker(app, display_queue, stop_event):
+    """Chuyển frame hiển thị sang ảnh PIL bên ngoài vòng detection/tracking."""
+    while not stop_event.is_set():
+        try:
+            item = display_queue.get(timeout=0.1)
+        except Empty:
+            continue
+
+        if item is None:
+            break
+
+        display_frame, display_width, display_height = item
+        try:
+            rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+            if display_width > 0 and display_height > 0:
+                rgb_frame = cv2.resize(rgb_frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
+            pil_image = Image.fromarray(rgb_frame)
+            with app.state_lock:
+                app.latest_pil_image = pil_image
+        except Exception as exc:
+            print(f"[DisplayWorker] bỏ qua frame: {exc}")
 
 
 def _select_torch_device():
@@ -568,7 +701,7 @@ def _select_torch_device():
 
 
 def _resize_for_processing(frame, process_width):
-    """Resize frame before detection/tracking; region templates scale automatically."""
+    """Resize frame trước detection/tracking; template vùng sẽ tự scale."""
     try:
         process_width = int(process_width)
     except Exception:
@@ -587,7 +720,7 @@ def _resize_for_processing(frame, process_width):
 
 
 def _predict_yolo(model, frame, *, model_imgsz, device, use_half, max_det):
-    """Run YOLO with fast settings, with fallback for older ultralytics versions."""
+    """Chạy YOLO với cấu hình nhanh, có fallback cho phiên bản ultralytics cũ."""
     kwargs = {
         "imgsz": int(model_imgsz),
         "conf": MODEL_CONF,
@@ -629,7 +762,7 @@ def _warmup_model(model, *, model_imgsz, device, use_half, max_det):
             max_det=max_det,
         )
     except Exception as exc:
-        print(f"[Perf] YOLO warmup skipped: {exc}")
+        print(f"[Hiệu năng] Bỏ qua warmup YOLO: {exc}")
 
 
 def _export_track_transition(exporter, *, meta, track_id, frame_id, current_time, from_region, to_region, cls, box, centroid, source="observed", confidence=1.0, reason="region_change"):
@@ -651,24 +784,47 @@ def _export_track_transition(exporter, *, meta, track_id, frame_id, current_time
 
 
 def process_video(app, video_path, model_path):
-    """
-    Process a video/live source in a background thread.
+    """Xử lý video/stream trong worker nền hoặc trong chế độ headless.
 
-    For file input, playback is limited to the source FPS.
-    For webcam/RTSP/HTTP input, old frames are dropped when processing is slow so
-    the display stays close to real time.
+    Với GUI, worker cập nhật ảnh preview và chỉ số realtime.
+    Với headless, worker bỏ toàn bộ preview, mặc định không bỏ frame và xuất flow CSV.
     """
     reader_thread = None
+    display_thread = None
+    display_queue = None
     cap = None
     exporter = None
     try:
-        _configure_runtime()
+        headless_mode = bool(getattr(app, "headless", False))
+        last_headless_progress_print = 0.0
         performance_profile, performance_cfg = _get_performance_cfg(app)
+        cpu_threads = _configure_runtime(performance_cfg)
         model_imgsz = int(performance_cfg.get("model_imgsz", MODEL_IMGSZ))
         process_width = int(performance_cfg.get("process_width", 0))
         display_every_n = max(1, int(performance_cfg.get("display_every_n", 1)))
         detect_interval = max(1, int(performance_cfg.get("detect_interval", getattr(app, "detect_interval", 1))))
         max_det = max(1, int(performance_cfg.get("max_det", 300)))
+        track_ignored_classes = bool(performance_cfg.get("track_ignored_classes", True))
+        drop_frames_when_slow = bool(performance_cfg.get("drop_frames_when_slow", False))
+        display_width = max(1, int(performance_cfg.get("display_width", 880)))
+        display_height = max(1, int(performance_cfg.get("display_height", 620)))
+        async_display = bool(performance_cfg.get("async_display", ASYNC_DISPLAY_CONVERSION))
+
+        if headless_mode:
+            # Chế độ headless chỉ xuất CSV, không tạo ảnh preview để tránh tốn CPU/RAM.
+            async_display = False
+            display_every_n = 10**9
+            display_width = 0
+            display_height = 0
+
+        if async_display:
+            display_queue = Queue(maxsize=max(1, int(performance_cfg.get("display_queue_size", DISPLAY_CONVERSION_QUEUE_SIZE))))
+            display_thread = threading.Thread(
+                target=_display_converter_worker,
+                args=(app, display_queue, app.stop_event),
+                daemon=True,
+            )
+            display_thread.start()
 
         device = _select_torch_device()
         use_half = bool(performance_cfg.get("half_cuda", True)) and str(device).startswith("cuda")
@@ -686,7 +842,7 @@ def process_video(app, video_path, model_path):
         mapping_warnings = _validate_model_class_mapping(model)
         if mapping_warnings:
             warning_text = "Class mapping mismatch: " + "; ".join(mapping_warnings)
-            print("[Model Warning]", warning_text)
+            print("[Cảnh báo model]", warning_text)
             with app.state_lock:
                 app.worker_state["status"] = warning_text
 
@@ -702,28 +858,79 @@ def process_video(app, video_path, model_path):
         if not cap.isOpened():
             raise RuntimeError("Không thể mở video/camera/stream")
 
-        fps_input = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        if fps_input <= 1.0 or fps_input > 240.0:
-            fps_input = 30.0
+        raw_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        fps_input, fps_metadata_valid = _sanitize_capture_fps(raw_fps, fallback=30.0)
+        target_process_fps, fps_downsample_enabled = _resolve_target_process_fps(fps_input, performance_cfg)
+        target_frame_period = 1.0 / target_process_fps if target_process_fps > 0 else 0.0
 
-        frame_duration = 1.0 / fps_input
-        buffer_size = REALTIME_QUEUE_SIZE if realtime_source else max(8, int(fps_input * FILE_QUEUE_SECONDS))
+        low_latency_queue = realtime_source or drop_frames_when_slow
+        realtime_queue_size = max(1, int(performance_cfg.get("realtime_queue_size", REALTIME_QUEUE_SIZE)))
+        buffer_size = realtime_queue_size if low_latency_queue else max(8, int(target_process_fps * FILE_QUEUE_SECONDS))
         frame_queue = Queue(maxsize=buffer_size)
         reader_done = threading.Event()
 
         def video_reader():
+            source_frame_id = 0
+            next_sample_time = 0.0
+            live_last_emit_time = 0.0
+            reader_start = time.time()
+            file_playback_start = time.time()
+
             try:
                 while cap.isOpened() and not app.stop_event.is_set():
-                    ret, frame = cap.read()
+                    if realtime_source:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+
+                        source_frame_id += 1
+                        now = time.time()
+                        # Giới hạn mềm nguồn live để tránh đưa 60/120 FPS
+                        # frame camera vào pipeline xử lý 30 FPS. Queue
+                        # vẫn bỏ frame cũ nếu xử lý chậm hơn.
+                        if target_frame_period > 0 and live_last_emit_time > 0:
+                            if now - live_last_emit_time < target_frame_period:
+                                continue
+                        live_last_emit_time = now
+                        source_time = now - reader_start
+                        _put_frame(frame_queue, (frame, source_frame_id, source_time), True, app.stop_event)
+                        continue
+
+                    # Với file: dùng grab() cho frame bị bỏ để OpenCV tránh
+                    # decode đầy đủ các frame không được xử lý. Cách này
+                    # nhẹ hơn nhiều với video 60/120 FPS.
+                    ret = cap.grab()
                     if not ret:
                         break
-                    _put_frame(frame_queue, frame, realtime_source, app.stop_event)
+
+                    source_frame_id += 1
+                    source_time = (source_frame_id - 1) / fps_input if fps_input > 0 else 0.0
+
+                    if fps_downsample_enabled and target_frame_period > 0:
+                        if source_time + 1e-9 < next_sample_time:
+                            continue
+                        while next_sample_time <= source_time + 1e-9:
+                            next_sample_time += target_frame_period
+
+                    if drop_frames_when_slow:
+                        # Replay file theo realtime: thời gian input == thời gian output.
+                        # Reader chạy theo source_time; nếu worker đang bận,
+                        # frame cũ trong queue bị bỏ thay vì tích lũy độ trễ.
+                        delay = file_playback_start + source_time - time.time()
+                        if delay > 0:
+                            time.sleep(delay)
+
+                    ret, frame = cap.retrieve()
+                    if not ret:
+                        break
+
+                    _put_frame(frame_queue, (frame, source_frame_id, source_time), low_latency_queue, app.stop_event)
             finally:
                 reader_done.set()
                 cap.release()
 
         with app.state_lock:
-            app.worker_state["status"] = "Opening live source..." if realtime_source else "Buffering video..."
+            app.worker_state["status"] = "Đang mở nguồn live..." if realtime_source else "Đang đệm video..."
 
         reader_thread = threading.Thread(target=video_reader, daemon=True)
         reader_thread.start()
@@ -738,24 +945,31 @@ def process_video(app, video_path, model_path):
 
         with app.state_lock:
             source_mode = "live" if realtime_source else "file"
+            fps_note = "valid" if fps_metadata_valid else "fallback"
+            downsample_note = f", process_fps={target_process_fps:.1f}"
+            if fps_downsample_enabled:
+                downsample_note += " (downsampled)"
             app.worker_state["status"] = (
-                f"{source_mode.title()} source ready @ {fps_input:.1f} FPS | "
-                f"perf={performance_profile}, device={device}, imgsz={model_imgsz}, width={process_width or 'native'}"
+                f"{source_mode.title()} source ready @ source_fps={fps_input:.1f} ({fps_note})"
+                f"{downsample_note} | "
+                f"perf={performance_profile}, device={device}, cpu_threads={cpu_threads}, "
+                f"async_display={async_display}, skip_stale={drop_frames_when_slow}, q={buffer_size}, "
+                f"display/{display_every_n}, imgsz={model_imgsz}, width={process_width or 'native'}"
             )
 
         if app.region_template and app.region_template.loaded:
-            # Center is always a valid row in the UI. Lane regions are valid
-            # only when present in template.csv; this supports partial templates
-            # while preserving the 8-lane layout in config.py.
+            # Center luôn là một dòng hợp lệ trong UI. Vùng làn chỉ hợp lệ
+            # khi có trong template.csv; điều này hỗ trợ template chưa đầy đủ
+            # nhưng vẫn giữ bố cục 8 làn trong config.py.
             valid_branches = (set(app.region_template.regions.keys()) & VALID_BRANCHES) | {"center"}
         else:
             valid_branches = set(VALID_BRANCHES)
 
-        # Cumulative totals use real tracking events:
-        # - IN when a tracked vehicle enters a region/branch.
-        # - OUT when that same tracked vehicle leaves the region/branch.
-        # Therefore IN and OUT are not forced to be equal at the same frame;
-        # temporary mismatch means vehicles are currently inside a region.
+        # Tổng tích lũy dùng event tracking thật:
+        # - IN khi phương tiện được track đi vào vùng/nhánh.
+        # - OUT khi chính track đó rời vùng/nhánh.
+        # Vì vậy IN và OUT không bị ép bằng nhau tại cùng một frame;
+        # lệch tạm thời nghĩa là đang có xe nằm trong vùng.
         branch_count_total = Counter()
         branch_class_count_total = Counter()
         branch_event_windows = {
@@ -778,30 +992,46 @@ def process_video(app, video_path, model_path):
                 region_state_sample_seconds=getattr(app, "region_state_sample_seconds", 1.0),
                 hidden_left_enabled=bool(app.infer_hidden_left_var.get()),
             )
+            try:
+                app.export_output_dir = exporter.output_dir
+            except Exception:
+                pass
             with app.state_lock:
-                app.worker_state["status"] = f"Exporting flow to {exporter.output_dir}"
+                app.worker_state["status"] = f"Đang xuất flow vào {exporter.output_dir}"
 
         track_meta = {}
         prev_time = time.time()
         playback_start = time.time()
         processing_start = time.time()
-        frame_id = 0
+        frame_id = 0                 # processed frame id, after FPS downsampling
+        source_frame_id = 0          # original video/camera frame id
+        last_source_time = 0.0       # original video time for export/replay
 
         while not app.stop_event.is_set():
             try:
-                frame = frame_queue.get(timeout=0.1)
+                frame_item = frame_queue.get(timeout=0.1)
             except Empty:
                 if reader_done.is_set() and frame_queue.empty():
                     break
                 continue
 
+            if isinstance(frame_item, tuple) and len(frame_item) == 3:
+                frame, source_frame_id, source_time = frame_item
+            else:
+                # Fallback tương thích ngược cho item queue cũ.
+                frame = frame_item
+                source_frame_id = source_frame_id + 1
+                source_time = time.time() - processing_start if realtime_source else frame_id / max(fps_input, 1.0)
+
             frame_id += 1
-            current_time = time.time() - processing_start if realtime_source else frame_id / fps_input
+            current_time = float(source_time)
+            last_source_time = current_time
             frame = _resize_for_processing(frame, process_width)
             should_update_display = (frame_id % display_every_n == 0)
             display_frame = frame.copy() if should_update_display else None
 
             detections = []
+            display_only_detections = []
             if frame_id % detect_interval == 0:
                 results = _predict_yolo(
                     model,
@@ -828,16 +1058,24 @@ def process_video(app, video_path, model_path):
                             continue
 
                         w, h = x2 - x1, y2 - y1
-                        detections.append(([x1, y1, w, h], conf, cls))
+
+                        # Trong cảnh đông, box person có thể rất nhiều và khiến
+                        # DeepSORT thành bottleneck dù person không dùng
+                        # cho PCE/count/flow. Các profile nhanh vẫn giữ person hiển thị như
+                        # box YOLO, nhưng không gán ID DeepSORT cho person.
+                        if (cls not in COUNTED_CLASS_IDS) and (not track_ignored_classes):
+                            display_only_detections.append(([x1, y1, w, h], conf, cls))
+                        else:
+                            detections.append(([x1, y1, w, h], conf, cls))
 
                 detections = _suppress_duplicate_detections(detections)
 
             tracks = tracker.update_tracks(detections, frame=frame)
             primary_tracks, duplicate_track_ids = _suppress_duplicate_tracks(tracks, track_meta)
             for duplicate_id in duplicate_track_ids:
-                # If this duplicate/ghost ID had already emitted IN before being
-                # recognized as duplicate, close that visit with OUT before
-                # removing it. Otherwise Moto In can stay higher than Moto Out.
+                # Nếu ID trùng/ghost này đã phát IN trước khi được
+                # nhận ra là trùng, đóng lượt đó bằng OUT trước khi
+                # xóa nó. Nếu không, Moto In có thể cao hơn Moto Out.
                 duplicate_meta = track_meta.get(duplicate_id)
                 if duplicate_meta is not None:
                     _emit_active_branch_out(
@@ -864,9 +1102,9 @@ def process_video(app, video_path, model_path):
                     f"suppressed={len(duplicate_track_ids)}"
                 )
 
-            # Tracks missing for only a few frames are kept to avoid false OUT events.
-            # But if the last box was close to the frame edge, close the visit
-            # sooner because the vehicle likely left the camera view.
+            # Track mất chỉ vài frame được giữ lại để tránh OUT giả.
+            # Nhưng nếu box cuối gần mép frame, đóng lượt
+            # sớm hơn vì xe có khả năng đã rời vùng camera.
             tracks_to_remove = []
             frame_h, frame_w = frame.shape[:2]
             for track_id, meta in list(track_meta.items()):
@@ -916,12 +1154,20 @@ def process_video(app, video_path, model_path):
                     branch_event_windows,
                 )
                 if emitted and DEBUG_TRACK_LOGS:
-                    print(f"[Flow] OUT by lost track: track_id={track_id} near_edge={near_edge}")
+                    print(f"[Flow] OUT do mất track: track_id={track_id} gần_mép={near_edge}")
 
                 tracks_to_remove.append(track_id)
 
             for track_id in tracks_to_remove:
                 del track_meta[track_id]
+
+            if should_update_display and display_frame is not None and display_only_detections:
+                for det_box, det_conf, det_cls in display_only_detections:
+                    x, y, w, h = [int(v) for v in det_box]
+                    color = CLASS_COLORS.get(int(det_cls), (180, 180, 180))
+                    label = f"{CLASS_NAMES.get(int(det_cls), det_cls)} {float(det_conf):.2f}"
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 1)
+                    cv2.putText(display_frame, label, (x, max(12, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             for track in primary_tracks:
                 track_id = track.track_id
@@ -974,9 +1220,9 @@ def process_video(app, video_path, model_path):
                     if stable_region in valid_branches and _is_counted_cls(cls):
                         previous_fluid_region = meta.get("last_fluid_region")
                         if previous_fluid_region is None:
-                            # First stable region for this track. If it appears
-                            # in center close to the hidden-left gate, create an
-                            # inferred left->center input edge for fluid replay.
+                            # Vùng ổn định đầu tiên của track này. Nếu nó xuất hiện
+                            # trong center gần cổng trái bị khuất, tạo
+                            # cạnh suy luận left->center cho fluid replay.
                             if (
                                 bool(app.infer_hidden_left_var.get())
                                 and stable_region == "center"
@@ -1054,7 +1300,7 @@ def process_video(app, video_path, model_path):
                             event_cls=event_cls,
                         )
                         if emitted and DEBUG_TRACK_LOGS:
-                            print(f"[Flow] IN: branch={stable_region} cls={event_cls} track_id={track_id}")
+                            print(f"[Flow] IN: nhánh={stable_region} cls={event_cls} track_id={track_id}")
                         mark_branch_enter(meta, stable_region, counted=emitted, event_cls=event_cls)
 
                 if should_update_display and display_frame is not None:
@@ -1110,9 +1356,13 @@ def process_video(app, video_path, model_path):
 
             pil_image = None
             if should_update_display and display_frame is not None:
-                rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(rgb_frame)
-                pil_image = pil_image.resize((880, 620), Image.LANCZOS)
+                if async_display:
+                    _put_display_frame(display_queue, display_frame, display_width, display_height, app.stop_event)
+                else:
+                    rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    if display_width > 0 and display_height > 0:
+                        rgb_frame = cv2.resize(rgb_frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
+                    pil_image = Image.fromarray(rgb_frame)
 
             total_current_pce = 0.0
             total_in_count = 0
@@ -1138,8 +1388,8 @@ def process_video(app, video_path, model_path):
 
                 metric_updates[f"{branch}_pce"] = f"{pce_now:.1f}"
                 metric_updates[f"{branch}_count"] = str(count_now)
-                # Kept in worker_state for compatibility, even though app.py no
-                # longer shows branch-level veh/min columns.
+                # Giữ trong worker_state để tương thích, dù app.py không
+                # còn hiển thị cột veh/min theo nhánh.
                 metric_updates[f"{branch}_in_flow"] = f"{in_flow:.1f}"
                 metric_updates[f"{branch}_out_flow"] = f"{calc_veh_per_min(branch_event_windows[(branch, 'out')], app.flow_window):.1f}"
                 metric_updates[f"{branch}_in_count"] = str(branch_count_total[(branch, "in")])
@@ -1152,38 +1402,59 @@ def process_video(app, video_path, model_path):
 
                 total_current_pce += pce_now
                 if branch in INBOUND_LANE_REGIONS:
-                    # Total vehicles uses only inbound-lane entry events.
-                    # Outbound lanes and center are excluded to avoid counting
-                    # the same vehicle again after it passes through center.
+                    # Tổng xe chỉ dùng event vào của các làn vào.
+                    # Làn ra và center bị loại để tránh đếm
+                    # cùng một xe lần nữa sau khi đi qua center.
                     total_in_count += branch_count_total[(branch, "in")]
 
-            realtime_ratio = fps / fps_input if fps_input > 0 else 0.0
+            realtime_ratio = fps / target_process_fps if target_process_fps > 0 else 0.0
+            source_label = "trực tiếp" if realtime_source else "file"
+            downsample_label = f", src_fps={fps_input:.1f}->proc_fps={target_process_fps:.1f}"
+            display_label = "headless" if headless_mode else f"hiển_thị/{display_every_n}"
+            status_text = (
+                f"Đang chạy ({source_label}, {performance_profile}, {device}, "
+                f"{realtime_ratio:.2f}x tốc_độ_xử_lý{downsample_label}, detect/{detect_interval}, "
+                f"{display_label}, max_det={max_det}, "
+                f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
+            )
+
             with app.state_lock:
                 if pil_image is not None:
                     app.latest_pil_image = pil_image
-                source_label = "live" if realtime_source else "file"
-                app.worker_state["status"] = (
-                    f"Running ({source_label}, {performance_profile}, {device}, "
-                    f"{realtime_ratio:.2f}x realtime)"
-                )
-                app.worker_state["frame"] = str(frame_id)
+                app.worker_state["status"] = status_text
+                app.worker_state["frame"] = f"{frame_id}/{source_frame_id}"
                 app.worker_state["fps"] = f"{fps:.1f}"
                 app.worker_state["active_tracks"] = str(active_tracks)
                 app.worker_state["current_pce"] = f"{total_current_pce:.1f}"
                 app.worker_state["flow_veh_pm"] = str(total_in_count)
                 app.worker_state.update(metric_updates)
 
-            if not realtime_source:
-                expected_display = playback_start + (frame_id - 1) * frame_duration
+            if headless_mode:
+                now_print = time.time()
+                progress_interval = float(getattr(app, "headless_progress_interval", 10.0) or 10.0)
+                if now_print - last_headless_progress_print >= progress_interval:
+                    last_headless_progress_print = now_print
+                    print(
+                        f"[HEADLESS] video_t={current_time:9.1f}s "
+                        f"frame={frame_id}/{source_frame_id} fps={fps:5.1f} "
+                        f"tracks={active_tracks:3d} pce={total_current_pce:5.1f} "
+                        f"total_in={total_in_count} export={getattr(app, 'export_output_dir', '') or '-'}"
+                    )
+
+            if (not realtime_source) and (not drop_frames_when_slow) and (not headless_mode):
+                # Chế độ quality/offline giữ mọi frame đã lấy mẫu và căn replay
+                # trong worker. Chế độ file realtime được reader điều tiết,
+                # nên khi xử lý chậm sẽ bỏ frame cũ thay vì tích lũy độ trễ.
+                expected_display = playback_start + current_time
                 delay = expected_display - time.time()
                 if delay > 0:
                     time.sleep(delay)
 
-        # For a finished video file, close any still-open counted visits so the
-        # final report is balanced. This is not done while manually stopping a
-        # live stream because those vehicles may simply still be inside the view.
+        # Khi file video kết thúc, đóng mọi lượt đã đếm nhưng còn mở để
+        # báo cáo cuối cân bằng. Không làm việc này khi dừng thủ công
+        # với stream live vì các xe đó có thể vẫn đang nằm trong vùng nhìn.
         if (not app.stop_event.is_set()) and (not realtime_source):
-            final_time = frame_id / fps_input if fps_input > 0 else current_time
+            final_time = last_source_time
             for track_id, meta in list(track_meta.items()):
                 _emit_active_branch_out(
                     meta,
@@ -1235,7 +1506,7 @@ def process_video(app, video_path, model_path):
 
         if exporter is not None:
             exporter.write_region_state_snapshot(
-                time_s=(frame_id / fps_input if (not realtime_source and fps_input > 0) else current_time),
+                time_s=last_source_time,
                 frame_id=frame_id,
                 region_current_count={branch: 0 for branch in valid_branches},
                 region_current_pce={branch: 0.0 for branch in valid_branches},
@@ -1244,23 +1515,33 @@ def process_video(app, video_path, model_path):
 
         with app.state_lock:
             if exporter is not None:
-                app.worker_state["status"] = ("Stopped" if app.stop_event.is_set() else "Finished") + f" | export: {exporter.output_dir}"
+                app.worker_state["status"] = ("Đã dừng" if app.stop_event.is_set() else "Hoàn tất") + f" | export: {exporter.output_dir}"
             else:
-                app.worker_state["status"] = "Stopped" if app.stop_event.is_set() else "Finished"
+                app.worker_state["status"] = "Đã dừng" if app.stop_event.is_set() else "Hoàn tất"
 
     except Exception as exc:
         with app.state_lock:
-            app.worker_state["status"] = f"Error: {exc}"
+            app.worker_state["status"] = f"Lỗi: {exc}"
     finally:
         if reader_thread is not None:
             try:
                 reader_thread.join(timeout=1.0)
             except Exception:
                 pass
+        if display_queue is not None:
+            try:
+                display_queue.put_nowait(None)
+            except Exception:
+                pass
+        if display_thread is not None:
+            try:
+                display_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if exporter is not None:
             try:
                 exporter.close()
             except Exception as export_exc:
-                print(f"[FluidExport] Error while closing exporter: {export_exc}")
+                print(f"[FluidExport] Lỗi khi đóng exporter: {export_exc}")
         if cap is not None and cap.isOpened():
             cap.release()

@@ -1,21 +1,21 @@
-"""Fluid-flow export utilities.
+"""Tiện ích xuất dữ liệu flow dạng chất lỏng.
 
-This module exports data at two levels:
+Module này xuất dữ liệu ở hai mức:
 
-1. Validation/replay files
+1. File kiểm chứng/replay
    - track_replay.csv
    - region_transitions.csv
    - region_state_timeseries.csv
    - flow_edges_timeseries.csv
 
-2. RL-oriented files
+2. File hướng đến RL
    - od_routes.csv
    - rl_demand_timeseries.csv
    - rl_state_timeseries.csv
 
-The RL files are still macroscopic. They are not an RL environment by
-themselves; they provide demand/observation time series that can feed a future
-traffic-signal RL environment.
+Các file RL vẫn ở mức vĩ mô. Bản thân chúng chưa phải môi trường RL;
+chúng cung cấp chuỗi thời gian demand/observation để đưa vào môi trường
+RL điều khiển đèn giao thông sau này.
 """
 
 import csv
@@ -26,9 +26,59 @@ from collections import defaultdict, deque
 from datetime import datetime
 from pathlib import Path
 
-from .config import CLASS_NAMES, CLASS_WEIGHTS, COUNTED_CLASS_IDS, FLUID_REGIONS, ROAD_BRANCHES, REGION_TO_APPROACH, INBOUND_LANE_REGIONS
+from .config import (
+    CLASS_NAMES,
+    CLASS_WEIGHTS,
+    COUNTED_CLASS_IDS,
+    FLUID_REGIONS,
+    ROAD_BRANCHES,
+    REGION_TO_APPROACH,
+    REGION_DIRECTION,
+    INBOUND_LANE_REGIONS,
+    OUTBOUND_LANE_REGIONS,
+)
 
 UNKNOWN_REGION = "unknown"
+
+
+def _lane_type(region):
+    return REGION_DIRECTION.get(region, "unknown")
+
+
+def _approach(region):
+    return REGION_TO_APPROACH.get(region, "unknown")
+
+
+def _edge_type(from_region, to_region):
+    if from_region in INBOUND_LANE_REGIONS and to_region == "center":
+        return "inbound_to_center"
+    if from_region == "center" and to_region in OUTBOUND_LANE_REGIONS:
+        return "center_to_outbound"
+    if from_region in OUTBOUND_LANE_REGIONS and to_region == "center":
+        return "outbound_to_center_unexpected"
+    if from_region == "center" and to_region in INBOUND_LANE_REGIONS:
+        return "center_to_inbound_unexpected"
+    if from_region in ROAD_BRANCHES and to_region in ROAD_BRANCHES:
+        return "lane_to_lane_direct"
+    if from_region == "center" and to_region == "center":
+        return "center_internal"
+    return "other"
+
+
+def _is_valid_8lane_edge(from_region, to_region):
+    return int(_edge_type(from_region, to_region) in {"inbound_to_center", "center_to_outbound"})
+
+
+def _route_type(origin, destination):
+    if origin in INBOUND_LANE_REGIONS and destination in OUTBOUND_LANE_REGIONS:
+        return "inbound_to_outbound"
+    if origin == UNKNOWN_REGION and destination in OUTBOUND_LANE_REGIONS:
+        return "unknown_to_outbound"
+    if origin in INBOUND_LANE_REGIONS and destination == UNKNOWN_REGION:
+        return "inbound_to_unknown"
+    if origin in ROAD_BRANCHES and destination in ROAD_BRANCHES:
+        return "nonstandard_lane_route"
+    return "unknown"
 
 
 def _safe_stem(value):
@@ -83,7 +133,7 @@ def _combine_source(a, b):
 
 
 class FluidFlowExporter:
-    """Export raw tracking and aggregated macroscopic traffic-flow CSV files."""
+    """Xuất file CSV tracking thô và flow giao thông vĩ mô đã gom nhóm."""
 
     def __init__(
         self,
@@ -120,12 +170,12 @@ class FluidFlowExporter:
         self.track_replay_path = os.path.join(self.output_dir, "track_replay.csv")
         self.transition_path = os.path.join(self.output_dir, "region_transitions.csv")
         self.region_state_path = os.path.join(self.output_dir, "region_state_timeseries.csv")
-        # Raw, event-level edge flow. This is the preferred file for replay/RL data
-        # because it preserves real timestamps and does not apply binning, smoothing,
-        # or interpolation. The simulator decides how to aggregate it at runtime.
+        # Flow theo cạnh ở mức event thô. Đây là file ưu tiên cho replay/dữ liệu RL
+        # vì giữ nguyên timestamp thật và không áp dụng gom bin, làm mượt,
+        # hoặc nội suy. Script mô phỏng sẽ quyết định cách gom dữ liệu lúc chạy.
         self.edge_real_path = os.path.join(self.output_dir, "flow_edges_real.csv")
-        # Backward-compatible aggregated file. It is still written for quick CSV
-        # inspection, but the replay script defaults to flow_edges_real.csv.
+        # File đã gom nhóm để tương thích ngược. Vẫn được ghi để xem nhanh CSV,
+        # nhưng script replay mặc định dùng flow_edges_real.csv.
         self.edge_timeseries_path = os.path.join(self.output_dir, "flow_edges_timeseries.csv")
         self.od_routes_path = os.path.join(self.output_dir, "od_routes.csv")
         self.rl_demand_path = os.path.join(self.output_dir, "rl_demand_timeseries.csv")
@@ -191,6 +241,8 @@ class FluidFlowExporter:
         return [
             "transition_id", "time_s", "frame", "track_id",
             "from_region", "to_region", "edge",
+            "from_approach", "to_approach", "from_lane_type", "to_lane_type",
+            "edge_type", "is_valid_8lane_edge",
             "class_id", "class_name", "pce", "source", "confidence", "reason",
             "x1", "y1", "x2", "y2", "cx", "cy",
         ]
@@ -205,6 +257,8 @@ class FluidFlowExporter:
         return [
             "event_id", "time_s", "frame", "track_id",
             "from_region", "to_region", "edge",
+            "from_approach", "to_approach", "from_lane_type", "to_lane_type",
+            "edge_type", "is_valid_8lane_edge",
             "vehicle_count", "pce",
             "class_id", "class_name",
             "source", "confidence", "reason",
@@ -230,7 +284,10 @@ class FluidFlowExporter:
     def _route_header(self):
         return [
             "route_id", "time_s", "entry_time_s", "travel_time_s", "frame", "track_id",
-            "origin", "destination", "od", "class_id", "class_name", "pce",
+            "origin", "destination", "od",
+            "origin_approach", "destination_approach", "origin_lane_type", "destination_lane_type",
+            "route_type",
+            "class_id", "class_name", "pce",
             "source", "confidence", "entry_source", "exit_source", "reason",
         ]
 
@@ -337,12 +394,21 @@ class FluidFlowExporter:
         })
 
     def _register_route_from_transition(self, event, *, reason):
+        """Xây dựng route OD thật cho bố cục 8 làn.
+
+        Route thật hợp lệ được ghép theo dạng:
+            làn vào (t1/l1/r1/b1) -> center -> làn ra (t2/l2/r2/b2)
+
+        Các chuyển tiếp bất thường vẫn được xuất dưới dạng cạnh thô trong
+        flow_edges_real.csv, còn od_routes.csv tập trung vào các hướng di chuyển
+        hữu ích cho mô phỏng/RL.
+        """
         track_id = event["track_id"]
         from_region = event["from_region"]
         to_region = event["to_region"]
 
-        # Entry into the junction. Store the current origin for this track.
-        if to_region == "center" and from_region in ROAD_BRANCHES:
+        # Xe đi vào nút giao từ làn vào. Lưu origin.
+        if to_region == "center" and from_region in INBOUND_LANE_REGIONS:
             self._pending_origin_by_track[track_id] = {
                 "origin": from_region,
                 "entry_time_s": event["time_s"],
@@ -354,8 +420,8 @@ class FluidFlowExporter:
             }
             return
 
-        # Exit from the junction. Pair with previous origin if available.
-        if from_region == "center" and to_region in ROAD_BRANCHES:
+        # Xe rời nút giao sang làn ra. Ghép với origin trước đó.
+        if from_region == "center" and to_region in OUTBOUND_LANE_REGIONS:
             pending = self._pending_origin_by_track.pop(track_id, None)
             if pending is None:
                 self._write_route_event(
@@ -367,22 +433,16 @@ class FluidFlowExporter:
                     destination=to_region,
                     cls=event["class_id"],
                     pce=event["pce"],
-                    source="unknown",
+                    source=event["source"],
                     confidence=event["confidence"],
                     entry_source="unknown",
                     exit_source=event["source"],
-                    reason="exit_without_observed_entry",
+                    reason="exit_without_observed_inbound_entry",
                 )
                 return
 
             origin = pending["origin"]
             destination = to_region
-            if origin == destination:
-                # U-turn/noise can still be useful for debugging but is less useful
-                # for traffic-light RL demand. Keep it in od_routes.
-                route_reason = "u_turn_or_region_noise"
-            else:
-                route_reason = reason
             confidence = min(float(pending["confidence"]), float(event["confidence"]))
             source = _combine_source(pending["source"], event["source"])
             self._write_route_event(
@@ -398,12 +458,13 @@ class FluidFlowExporter:
                 confidence=confidence,
                 entry_source=pending["source"],
                 exit_source=event["source"],
-                reason=route_reason,
+                reason=reason,
             )
             return
 
-        # Direct branch->branch transition can happen if center is missing/too small.
-        if from_region in ROAD_BRANCHES and to_region in ROAD_BRANCHES and from_region != to_region:
+        # Chuyển thẳng inbound->outbound có thể xảy ra nếu polygon center
+        # bị mất trong vài frame. Giữ lại như route thật nhưng chất lượng thấp hơn.
+        if from_region in INBOUND_LANE_REGIONS and to_region in OUTBOUND_LANE_REGIONS:
             self._write_route_event(
                 time_s=event["time_s"],
                 entry_time_s=event["time_s"],
@@ -417,7 +478,7 @@ class FluidFlowExporter:
                 confidence=event["confidence"],
                 entry_source=event["source"],
                 exit_source=event["source"],
-                reason="direct_branch_to_branch_transition",
+                reason="direct_inbound_to_outbound_transition_center_missing",
             )
 
     def _write_route_event(self, *, time_s, entry_time_s, frame, track_id, origin, destination, cls, pce, source, confidence, entry_source, exit_source, reason):
@@ -434,6 +495,11 @@ class FluidFlowExporter:
             "origin": origin,
             "destination": destination,
             "od": f"{origin}->{destination}",
+            "origin_approach": _approach(origin),
+            "destination_approach": _approach(destination),
+            "origin_lane_type": _lane_type(origin),
+            "destination_lane_type": _lane_type(destination),
+            "route_type": _route_type(origin, destination),
             "class_id": cls,
             "class_name": CLASS_NAMES.get(cls, str(cls)),
             "pce": f"{float(pce):.3f}",
@@ -482,6 +548,12 @@ class FluidFlowExporter:
             "from_region": from_region,
             "to_region": to_region,
             "edge": f"{from_region}->{to_region}",
+            "from_approach": _approach(from_region),
+            "to_approach": _approach(to_region),
+            "from_lane_type": _lane_type(from_region),
+            "to_lane_type": _lane_type(to_region),
+            "edge_type": _edge_type(from_region, to_region),
+            "is_valid_8lane_edge": _is_valid_8lane_edge(from_region, to_region),
             "class_id": cls,
             "class_name": CLASS_NAMES.get(cls, str(cls)),
             "pce": f"{pce:.3f}",
@@ -492,9 +564,9 @@ class FluidFlowExporter:
         }
         self._transition_writer.writerow(row)
 
-        # Write the raw flow edge immediately. This file is intentionally not
-        # resampled. Runtime replay/RL scripts choose bin width, smoothing, and
-        # interpolation policies through CLI parameters.
+        # Ghi cạnh flow thô ngay lập tức. File này được cố ý không
+        # resample. Script replay/RL lúc chạy sẽ chọn độ rộng bin, smoothing và
+        # chính sách nội suy thông qua tham số CLI.
         self._edge_real_writer.writerow({
             "event_id": self._transition_seq,
             "time_s": f"{float(time_s):.3f}",
@@ -503,6 +575,12 @@ class FluidFlowExporter:
             "from_region": from_region,
             "to_region": to_region,
             "edge": f"{from_region}->{to_region}",
+            "from_approach": _approach(from_region),
+            "to_approach": _approach(to_region),
+            "from_lane_type": _lane_type(from_region),
+            "to_lane_type": _lane_type(to_region),
+            "edge_type": _edge_type(from_region, to_region),
+            "is_valid_8lane_edge": _is_valid_8lane_edge(from_region, to_region),
             "vehicle_count": 1,
             "pce": f"{pce:.3f}",
             "class_id": cls,
@@ -519,6 +597,12 @@ class FluidFlowExporter:
             "from_region": from_region,
             "to_region": to_region,
             "edge": f"{from_region}->{to_region}",
+            "from_approach": _approach(from_region),
+            "to_approach": _approach(to_region),
+            "from_lane_type": _lane_type(from_region),
+            "to_lane_type": _lane_type(to_region),
+            "edge_type": _edge_type(from_region, to_region),
+            "is_valid_8lane_edge": _is_valid_8lane_edge(from_region, to_region),
             "class_id": cls,
             "pce": pce,
             "source": source,
@@ -547,8 +631,6 @@ class FluidFlowExporter:
             count_now = int(region_current_count.get(region, 0))
             pce_now = float(region_current_pce.get(region, 0.0))
             source = "observed" if region in self.valid_regions else "unavailable"
-            if region == "left" and count_now == 0 and self.hidden_left_enabled:
-                source = "hidden_or_unobserved"
             self._state_writer.writerow({
                 "time_s": f"{time_s:.3f}",
                 "dt_s": f"{dt_s:.3f}",
@@ -687,7 +769,7 @@ class FluidFlowExporter:
         if not self._state_snapshots:
             return {}
         keys = sorted(self._state_snapshots.keys())
-        # previous snapshot is causal and best for RL observations
+        # snapshot trước đó là dạng nhân quả và phù hợp nhất cho observation RL
         best = keys[0]
         for key in keys:
             if key <= time_s:
@@ -702,7 +784,7 @@ class FluidFlowExporter:
         n_bins = int(math.floor(max_time / bin_s)) + 1
 
         ods = [(o, d) for o in ROAD_BRANCHES for d in ROAD_BRANCHES if o != d]
-        # Include unknown origins/destinations for auditing, not for default RL env.
+        # Giữ origin/destination không rõ để kiểm tra, không dùng mặc định cho env RL.
         for event in self._route_events:
             pair = (event["origin"], event["destination"])
             if pair not in ods:
@@ -775,8 +857,8 @@ class FluidFlowExporter:
                 row = {
                     "time_s": f"{time_s:.3f}",
                     "dt_s": f"{bin_s:.3f}",
-                    # -1 means this row is only observation/demand from video;
-                    # there was no RL action taken in the source recording.
+                    # -1 nghĩa là dòng này chỉ là observation/demand từ video;
+                    # không có action RL nào trong bản ghi nguồn.
                     "action_phase": -1,
                     "reward_proxy": "0.000",
                     "total_queue_pce": "0.000",
@@ -809,7 +891,7 @@ class FluidFlowExporter:
                         ns_queue += q_pce
                     elif approach in ("left", "right"):
                         ew_queue += q_pce
-                    # Demand for controller input is counted from inbound lanes only.
+                    # Demand cho đầu vào controller chỉ được tính từ các làn vào.
                     if branch in INBOUND_LANE_REGIONS:
                         if approach in ("top", "bottom"):
                             ns_demand += demand
@@ -827,8 +909,8 @@ class FluidFlowExporter:
                 row["ew_demand_pce"] = f"{ew_demand:.3f}"
                 row["total_queue_pce"] = f"{total_queue + center_q:.3f}"
                 row["throughput_pce"] = f"{throughput:.3f}"
-                # Reward proxy is only a diagnostic. In true RL, reward should
-                # be computed after the environment applies an action.
+                # Reward proxy chỉ dùng để chẩn đoán. Trong RL thật, reward nên
+                # được tính sau khi môi trường áp dụng action.
                 row["reward_proxy"] = f"{throughput - 0.05 * (total_queue + center_q):.3f}"
                 writer.writerow(row)
 
