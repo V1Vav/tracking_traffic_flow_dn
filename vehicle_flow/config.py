@@ -196,7 +196,7 @@ MODEL_IOU = 0.60
 CLASS_CONF_THRESHOLDS = {
     0: 0.75,  # bus
     1: 0.86,  # car
-    2: 0.36,  # motorbike
+    2: 0.6,  # motorbike
     3: 0.2,  # pedestrian, chỉ detect/hiển thị
     4: 0.8,  # truck
 }
@@ -384,6 +384,12 @@ PERFORMANCE_PROFILES = {
         "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
         "region_label_scale": 1.00,
+        "region_stable_frames": 4,
+        "region_probe_points_enabled": True,
+        "region_fast_first_seen": False,
+        "region_fast_regions": ("r1", "r2"),
+        "region_lost_use_last_raw": True,
+        "region_lost_raw_max_age_frames": 10,
     },
     "balanced": {
         # 960p xử lý: mốc cân bằng để kiểm tra kết quả và vẫn giữ tốc độ khá tốt.
@@ -438,6 +444,12 @@ PERFORMANCE_PROFILES = {
         "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
         "region_label_scale": 0.85,
+        "region_stable_frames": 3,
+        "region_probe_points_enabled": True,
+        "region_fast_first_seen": True,
+        "region_fast_regions": ("r1", "r2"),
+        "region_lost_use_last_raw": True,
+        "region_lost_raw_max_age_frames": 12,
     },
     "realtime": {
         # 736p xử lý: mốc realtime cho RTX 3050 Laptop + i7 gen 11.
@@ -498,6 +510,12 @@ PERFORMANCE_PROFILES = {
         "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
         "region_label_scale": 0.65,
+        "region_stable_frames": 2,
+        "region_probe_points_enabled": True,
+        "region_fast_first_seen": True,
+        "region_fast_regions": ("r1", "r2"),
+        "region_lost_use_last_raw": True,
+        "region_lost_raw_max_age_frames": 14,
     },
 }
 

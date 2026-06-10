@@ -785,6 +785,77 @@ def _smooth_track_bbox(meta, raw_box, frame_width, frame_height, performance_cfg
     return smooth_box
 
 
+def _region_probe_points_from_box(box):
+    """Sinh các điểm thử bên trong bbox để cứu region khi bottom-center nằm ngoài polygon.
+
+    Ở r1/r2 xe thường chạm mép phải nhanh, bottom-center có thể bị nằm ngoài
+    polygon do bbox bị cắt bởi frame hoặc do smoothing. Thử thêm vài điểm thấp
+    và điểm giữa bbox giúp ID có vùng sớm hơn mà không cần nới template.
+    """
+    x1, y1, x2, y2 = [float(v) for v in box]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    cx = x1 + w * 0.5
+    cy = y1 + h * 0.5
+    return [
+        (int(cx), int(y2)),
+        (int(cx), int(y1 + h * 0.82)),
+        (int(cx), int(y1 + h * 0.66)),
+        (int(cx), int(cy)),
+        (int(x1 + w * 0.25), int(y1 + h * 0.86)),
+        (int(x2 - w * 0.25), int(y1 + h * 0.86)),
+        (int(x1 + w * 0.18), int(cy)),
+        (int(x2 - w * 0.18), int(cy)),
+    ]
+
+
+def _resolve_region_for_track(box, frame_width, frame_height, app, previous_region_point, previous_region, performance_cfg):
+    """Trả về (raw_region, region_point).
+
+    Điểm chính vẫn là bottom-center để đúng mặt đường. Nếu điểm này không nằm
+    trong vùng nào, realtime sẽ dò thêm các điểm trong bbox. Điều này đặc biệt
+    hữu ích cho r1/r2, nơi xe rời frame nhanh trước khi stable_region đủ frame.
+    """
+    primary_point = region_point_from_box(
+        box,
+        use_bottom_center=USE_BOTTOM_CENTER_FOR_REGION,
+    )
+    raw_region = get_direction_region(
+        primary_point,
+        frame_width,
+        frame_height,
+        app.region_margin,
+        app.region_template,
+        previous_centroid=previous_region_point,
+        current_region=previous_region,
+    )
+    if raw_region is not None:
+        return raw_region, primary_point
+
+    cfg = performance_cfg or {}
+    if not bool(cfg.get("region_probe_points_enabled", True)):
+        return raw_region, primary_point
+
+    seen = {primary_point}
+    for point in _region_probe_points_from_box(box):
+        if point in seen:
+            continue
+        seen.add(point)
+        region = get_direction_region(
+            point,
+            frame_width,
+            frame_height,
+            app.region_margin,
+            app.region_template,
+            previous_centroid=previous_region_point,
+            current_region=previous_region,
+        )
+        if region is not None:
+            return region, point
+
+    return raw_region, primary_point
+
+
 def _box_near_frame_edge(box, frame_width, frame_height):
     """Trả về True nếu box gần nhất sắp rời khỏi vùng camera."""
     if box is None:
@@ -1782,6 +1853,19 @@ def process_video(app, video_path, model_path):
                 if missing_frames < lost_limit:
                     continue
 
+                if bool(performance_cfg.get("region_lost_use_last_raw", True)):
+                    last_raw_region = meta.get("last_raw_region")
+                    last_raw_frame = meta.get("last_raw_region_frame", frame_id)
+                    raw_age = frame_id - int(last_raw_frame or frame_id)
+                    max_raw_age = int(performance_cfg.get("region_lost_raw_max_age_frames", 12) or 12)
+                    if (
+                        meta.get("current_region") is None
+                        and last_raw_region in valid_branches
+                        and raw_age <= max_raw_age
+                    ):
+                        meta["stable_region"] = last_raw_region
+                        meta["current_region"] = last_raw_region
+
                 last_centroid = meta.get("last_centroid")
                 if (
                     exporter is not None
@@ -1861,21 +1945,18 @@ def process_video(app, video_path, model_path):
                 )
 
                 # Dùng điểm giữa cạnh dưới bbox để xác định vùng trên mặt đường.
-                # Tâm bbox vẫn hữu ích để vẽ box, nhưng dễ lệch vùng khi camera nhìn chéo.
-                region_point = region_point_from_box(
-                    (l, t, r, b),
-                    use_bottom_center=USE_BOTTOM_CENTER_FOR_REGION,
-                )
+                # Nếu điểm này không nằm trong polygon nào, dò thêm vài điểm trong bbox
+                # để r1/r2 cập nhật kịp trước khi xe rời frame.
                 previous_region_point = meta.get("last_region_point")
                 previous_region = meta.get("current_region") or meta.get("stable_region")
-                raw_region = get_direction_region(
-                    region_point,
+                raw_region, region_point = _resolve_region_for_track(
+                    (l, t, r, b),
                     frame.shape[1],
                     frame.shape[0],
-                    app.region_margin,
-                    app.region_template,
-                    previous_centroid=previous_region_point,
-                    current_region=previous_region,
+                    app,
+                    previous_region_point,
+                    previous_region,
+                    performance_cfg,
                 )
 
                 meta["last_seen_frame"] = frame_id
@@ -1883,7 +1964,14 @@ def process_video(app, video_path, model_path):
                 meta["duplicate_of"] = None
                 cls = update_stable_class(meta, det_cls, det_conf)
 
-                stable_region = update_stable_region(meta, raw_region)
+                stable_region = update_stable_region(
+                    meta,
+                    raw_region,
+                    frame_id=frame_id,
+                    stable_frames=performance_cfg.get("region_stable_frames"),
+                    fast_regions=performance_cfg.get("region_fast_regions", ()),
+                    fast_first_seen=bool(performance_cfg.get("region_fast_first_seen", False)),
+                )
                 meta["current_region"] = stable_region
                 meta["last_region_point"] = region_point
                 meta["last_centroid"] = region_point
@@ -2013,6 +2101,8 @@ def process_video(app, video_path, model_path):
                             label_parts.append(_class_display_name(cls))
 
                         region_label = stable_region if stable_region is not None else raw_region
+                        if region_label is None:
+                            region_label = meta.get("last_raw_region")
                         # Rút gọn text để không dài hơn bbox xe nhỏ.
                         # Format: ID12.t1 thay vì ID 12 - t1.
                         id_region_label = f"ID{track_id}"

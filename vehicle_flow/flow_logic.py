@@ -25,6 +25,8 @@ from .config import (
 def create_track_meta(frame_id, cls):
     return {
         "raw_history": deque(maxlen=REGION_HISTORY_LEN),
+        "last_raw_region": None,
+        "last_raw_region_frame": frame_id,
         "stable_region": None,
         "active_branch": None,
         "active_branch_counted": False,
@@ -112,14 +114,43 @@ def update_stable_class(meta, det_cls, det_conf=None):
     return stable_cls
 
 
-def update_stable_region(meta, raw_region):
-    """Chống nhiễu khi đổi vùng để tránh đếm sai ở mép polygon."""
-    meta["raw_history"].append(raw_region)
+def update_stable_region(
+    meta,
+    raw_region,
+    *,
+    frame_id=None,
+    stable_frames=None,
+    fast_regions=None,
+    fast_first_seen=False,
+):
+    """Chống nhiễu khi đổi vùng để tránh đếm sai ở mép polygon.
 
-    if len(meta["raw_history"]) < STABLE_REGION_FRAMES:
+    Với realtime, một số vùng sát mép ảnh như r1/r2 có thể chỉ xuất hiện
+    trong vài frame trước khi track mất. Nếu vẫn bắt đủ STABLE_REGION_FRAMES
+    như offline, ID có thể biến mất trước khi kịp nhận vùng. Vì vậy hàm cho
+    phép profile truyền fast_regions để chốt nhanh các vùng ngắn này, trong
+    khi các vùng khác vẫn dùng cơ chế ổn định nhiều frame.
+    """
+    if stable_frames is None:
+        stable_frames = STABLE_REGION_FRAMES
+    stable_frames = max(1, int(stable_frames))
+    fast_regions = set(fast_regions or ())
+
+    meta["raw_history"].append(raw_region)
+    if raw_region is not None:
+        meta["last_raw_region"] = raw_region
+        if frame_id is not None:
+            meta["last_raw_region_frame"] = frame_id
+
+    if raw_region is not None and raw_region in fast_regions:
+        if fast_first_seen or meta.get("stable_region") is not None:
+            meta["stable_region"] = raw_region
+            return raw_region
+
+    if len(meta["raw_history"]) < stable_frames:
         return meta["stable_region"]
 
-    recent = list(meta["raw_history"])[-STABLE_REGION_FRAMES:]
+    recent = list(meta["raw_history"])[-stable_frames:]
     if all(region == recent[0] for region in recent):
         meta["stable_region"] = recent[0]
 
