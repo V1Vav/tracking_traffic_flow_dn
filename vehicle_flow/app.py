@@ -12,6 +12,7 @@ from .config import (
     CLASS_COLORS,
     CLASS_DISPLAY_NAMES,
     CLASS_NAMES,
+    COLOR_LEGEND_CLASS_IDS,
     DEFAULT_AVAILABLE_MODELS,
     DEFAULT_EXPORT_ROOT,
     DEFAULT_FLUID_BIN_SECONDS,
@@ -247,23 +248,34 @@ class FlowApp:
         return CLASS_DISPLAY_NAMES.get(cls_id, self._vehicle_header_name(CLASS_NAMES.get(cls_id, str(cls_id)), "").strip())
 
     def _build_color_legend(self, parent):
-        legend_frame = ttk.LabelFrame(parent, text="  Chú thích màu  ", padding=(8, 5))
-        legend_frame.pack(fill="x", pady=(0, 6))
-        legend_frame.grid_columnconfigure(1, weight=1)
+        """Chú thích màu gọn một dòng để không che bảng thống kê bên dưới."""
+        legend_frame = ttk.Frame(parent, style="Card.TFrame")
+        legend_frame.pack(fill="x", pady=(0, 4))
+        legend_frame.grid_columnconfigure(len(COLOR_LEGEND_CLASS_IDS) * 2 + 1, weight=1)
 
-        for row, cls_id in enumerate(DISPLAY_CLASS_IDS):
+        ttk.Label(legend_frame, text="Màu:", style="MetricCompactName.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+
+        col = 1
+        for cls_id in COLOR_LEGEND_CLASS_IDS:
             color = self._bgr_to_hex(CLASS_COLORS.get(cls_id, (160, 160, 160)))
-            swatch = tk.Frame(legend_frame, width=18, height=12, bg=color, highlightthickness=1, highlightbackground=UI["border"])
-            swatch.grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+            swatch = tk.Frame(
+                legend_frame,
+                width=12,
+                height=10,
+                bg=color,
+                highlightthickness=1,
+                highlightbackground=UI["border"],
+            )
+            swatch.grid(row=0, column=col, sticky="w", padx=(0, 3))
             swatch.grid_propagate(False)
-            ttk.Label(legend_frame, text=self._vehicle_display_name(cls_id), style="Card.TLabel").grid(row=row, column=1, sticky="w", pady=2)
-
-        ttk.Label(
-            legend_frame,
-            text="BBox trên hình chỉ dùng màu, không hiện label để giảm rối.",
-            style="Muted.TLabel",
-            wraplength=330,
-        ).grid(row=len(DISPLAY_CLASS_IDS), column=0, columnspan=2, sticky="w", pady=(4, 0))
+            ttk.Label(
+                legend_frame,
+                text=self._vehicle_display_name(cls_id),
+                style="MetricCompactName.TLabel",
+            ).grid(row=0, column=col + 1, sticky="w", padx=(0, 8))
+            col += 2
 
     def _on_video_label_configure(self, event):
         """Lưu kích thước vùng hiển thị để worker resize video đúng tỉ lệ."""

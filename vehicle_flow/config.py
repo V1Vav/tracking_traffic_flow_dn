@@ -53,9 +53,10 @@ DETECT_CLASS_IDS = tuple(CLASS_NAMES.keys())
 # Các class được tính vào count/flow/PCE/file cho RL.
 COUNTED_CLASS_IDS = tuple(CLASS_WEIGHTS.keys())
 IGNORED_CLASS_IDS = tuple(sorted(set(DETECT_CLASS_IDS) - set(COUNTED_CLASS_IDS)))
-# Profile realtime có thể chỉ detect các class dùng cho count/PCE để giảm hậu xử lý/NMS/DeepSORT.
-# Pedestrian vẫn giữ trong model/config, nhưng không cần chạy khi ưu tiên tốc độ.
-REALTIME_DETECT_CLASS_IDS = COUNTED_CLASS_IDS
+# Profile realtime vẫn detect đủ class, bao gồm pedestrian. Pedestrian được track
+# bằng ByteTrack để hiển thị ID/bbox nhưng không thuộc COUNTED_CLASS_IDS nên
+# không tham gia PCE/count/flow.
+REALTIME_DETECT_CLASS_IDS = DETECT_CLASS_IDS
 EXPECTED_MODEL_NAMES = CLASS_NAMES.copy()
 
 # Bố cục vùng/làn. Mỗi nhánh đường được chia thành hai vùng làn:
@@ -69,6 +70,7 @@ BRANCH_ORDER = LANE_REGION_ORDER + ("center",)
 VALID_BRANCHES = set(BRANCH_ORDER)
 DIRECTIONS = ("in", "out")
 DISPLAY_CLASS_IDS = (0, 1, 2)  # Xe buýt, Ô tô, Xe máy
+COLOR_LEGEND_CLASS_IDS = (0, 1, 2, 3)  # thêm Người đi bộ vào chú thích màu, không đưa vào bảng đếm
 
 REGION_DISPLAY_NAMES = {
     "t1": "T1 Vao",
@@ -186,16 +188,16 @@ FRAME_EXIT_MARGIN_RATIO = 0.025
 # bằng CLASS_CONF_THRESHOLDS bên dưới. Cách này linh hoạt hơn một ngưỡng chung.
 MODEL_IMGSZ = 1280
 MODEL_CONF = 0.10
-MODEL_IOU = 0.50
+MODEL_IOU = 0.60
 
 # Ngưỡng confidence riêng theo từng class.
 # Tăng ngưỡng car/truck nếu xe máy thường bị đoán nhầm thành xe lớn.
 # Giảm ngưỡng motorbike nếu xe nhỏ bị bỏ sót nhiều.
 CLASS_CONF_THRESHOLDS = {
     0: 0.75,  # bus
-    1: 0.75,  # car
-    2: 0.3,  # motorbike
-    3: 0.3,  # pedestrian, chỉ detect/hiển thị
+    1: 0.86,  # car
+    2: 0.36,  # motorbike
+    3: 0.2,  # pedestrian, chỉ detect/hiển thị
     4: 0.8,  # truck
 }
 
@@ -207,7 +209,7 @@ MIN_BOX_WH = {
     0: (20, 20),  # bus
     1: (16, 16),  # car
     2: (8, 8),    # motorbike
-    3: (8, 14),   # pedestrian, chỉ detect/hiển thị
+    3: (10, 22),  # pedestrian, chỉ detect/hiển thị
     4: (20, 20),  # truck
 }
 
@@ -220,7 +222,7 @@ CLASS_ASPECT_RATIO_LIMITS = {
     0: (0.30, 7.00),  # bus/heavy vehicle
     1: (0.30, 5.50),  # car
     2: (0.18, 5.50),  # motorbike
-    3: (0.15, 2.80),  # pedestrian, chỉ detect/hiển thị
+    3: (0.18, 1.80),  # pedestrian, chỉ detect/hiển thị
     4: (0.30, 7.00),  # truck gốc, thường đã merge về 0
 }
 
@@ -237,11 +239,16 @@ PERSPECTIVE_MIN_AREA_RATIO = {
     0: (0.00045, 0.00350),  # bus/heavy vehicle
     1: (0.00030, 0.00220),  # car
     2: (0.00018, 0.00120),  # motorbike
-    3: (0.00012, 0.00080),  # pedestrian, nếu còn hiển thị
+    3: (0.00018, 0.00110),  # pedestrian, nếu còn hiển thị
 }
 
 # >1 nghĩa là vùng gần camera bị siết mạnh hơn, vùng xa vẫn thoáng.
 PERSPECTIVE_AREA_GAMMA = 1.35
+
+# Scale riêng cho phần xa/gần trong perspective filter.
+# near-only giúp tăng lọc nhiễu ở gần camera mà không làm mất xe máy nhỏ ở xa.
+PERSPECTIVE_FAR_MIN_AREA_SCALE = 1.0
+PERSPECTIVE_NEAR_MIN_AREA_SCALE = 1.0
 
 # Mở rộng bbox theo class sau YOLO và trước tracker.
 # Dùng cho trường hợp YOLO chỉ bắt phần thân xe máy, còn kính/ghi-đông phía trên
@@ -257,21 +264,21 @@ CLASS_BBOX_EXPAND_RATIO = {
 MOTORBIKE_PART_SUPPRESSION_ENABLED = True
 MOTORBIKE_PART_CLASS_ID = 2
 MOTORBIKE_PART_MAX_AREA_RATIO = 0.55   # box nhỏ < 55% diện tích box lớn mới bị xét là part
-MOTORBIKE_PART_MIN_IOA = 0.62          # phần giao / diện tích box nhỏ
+MOTORBIKE_PART_MIN_IOA = 0.70          # phần giao / diện tích box nhỏ
 
 
 # Khử detection trùng trước DeepSORT. Xử lý trường hợp thường gặp
 # khi YOLO trả nhiều box cho cùng một xe máy/ô tô, sau đó
 # bị DeepSORT tách thành nhiều ID.
-DETECTION_DUPLICATE_IOU = 0.35
-DETECTION_DUPLICATE_CONTAINMENT = 0.72
-DETECTION_DUPLICATE_CENTER_RATIO = 0.32
+DETECTION_DUPLICATE_IOU = 0.45
+DETECTION_DUPLICATE_CONTAINMENT = 0.82
+DETECTION_DUPLICATE_CENTER_RATIO = 0.30
 
 # Khử track DeepSORT trùng sau khi update. Tránh các ghost ID cũ
 # bị vẽ/đếm cùng ID mới của cùng một phương tiện.
-TRACK_DUPLICATE_IOU = 0.30
-TRACK_DUPLICATE_CONTAINMENT = 0.68
-TRACK_DUPLICATE_CENTER_RATIO = 0.35
+TRACK_DUPLICATE_IOU = 0.42
+TRACK_DUPLICATE_CONTAINMENT = 0.78
+TRACK_DUPLICATE_CENTER_RATIO = 0.32
 TRACK_STALE_MERGE_FRAMES = 180
 
 # Độ ổn định tracking DeepSORT. max_age nội bộ được để cao để tracker giữ
@@ -323,7 +330,7 @@ CLASS_COLORS = {
     0: (0, 190, 255),     # bus
     1: (0, 0, 255),       # car
     2: (255, 80, 0),      # motorbike
-    3: (160, 160, 160),   # pedestrian, bỏ qua trong flow
+    3: (255, 0, 255),     # pedestrian, màu tím/hồng để không trùng màu đường/vùng
     4: (255, 180, 0),     # truck
 }
 
@@ -347,15 +354,36 @@ PERFORMANCE_PROFILES = {
         "max_det": 300,
         "track_ignored_classes": True,
         "tracker_type": "deepsort",
+        "detection_conf_scale": 1.00,
+        # Quality giữ filter nền cho mọi class.
+        # Phần siết thêm chỉ áp dụng cho motorbike để giảm false detection xe máy
+        # ở 1280p mà không làm mất car/bus/pedestrian thật.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        "filter_min_box_wh_scale_by_class": {2: 1.},
+        "filter_min_box_area_scale_by_class": {2: 1.55},
+        # Chỉ siết mạnh motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
         "display_width": 960,
         "display_height": 680,
         "target_process_fps": TARGET_PROCESS_FPS,
         "drop_frames_when_slow": False,
         "realtime_queue_size": 3,
-        "bbox_thickness": 2,
+        "bbox_thickness": 3,
         "bbox_center_radius": 3,
-        "draw_track_labels": False,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.45,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.15,
+        "bbox_smooth_size_alpha": 0.45,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
+        "region_label_scale": 1.00,
     },
     "balanced": {
         # 960p xử lý: mốc cân bằng để kiểm tra kết quả và vẫn giữ tốc độ khá tốt.
@@ -366,7 +394,7 @@ PERFORMANCE_PROFILES = {
         "display_every_n": 1,
         "half_cuda": True,
         "max_det": 200,
-        "track_ignored_classes": False,
+        "track_ignored_classes": True,
         "tracker_type": "bytetrack_lite",
         "bytetrack_high_thresh": 0.45,
         "bytetrack_low_thresh": 0.10,
@@ -381,7 +409,17 @@ PERFORMANCE_PROFILES = {
         "bytetrack_min_iou_for_center_match": 0.01,
         "bytetrack_min_size_similarity": 0.40,
         "track_display_max_age": 1,
-        "detection_conf_scale": 0.90,
+        "detection_conf_scale": 1.00,
+        # Balanced giữ filter nền cho mọi class.
+        # Phần siết thêm chỉ áp dụng cho motorbike; các class khác dùng scale 1.0.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        "filter_min_box_wh_scale_by_class": {2: 1.15},
+        "filter_min_box_area_scale_by_class": {2: 1.25},
+        # Chỉ siết motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
         "display_width": 900,
         "display_height": 640,
         "target_process_fps": 25.0,
@@ -389,8 +427,17 @@ PERFORMANCE_PROFILES = {
         "realtime_queue_size": 2,
         "bbox_thickness": 2,
         "bbox_center_radius": 3,
-        "draw_track_labels": False,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.38,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.20,
+        "bbox_smooth_size_alpha": 0.60,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
+        "region_label_scale": 0.85,
     },
     "realtime": {
         # 736p xử lý: mốc realtime cho RTX 3050 Laptop + i7 gen 11.
@@ -402,8 +449,8 @@ PERFORMANCE_PROFILES = {
         "display_every_n": 1,
         "half_cuda": True,
         "max_det": 160,
-        "track_ignored_classes": False,
-        "detect_class_ids": None,
+        "track_ignored_classes": True,
+        "detect_class_ids": REALTIME_DETECT_CLASS_IDS,
         "tracker_type": "bytetrack_lite",
         "bytetrack_high_thresh": 0.45,
         "bytetrack_low_thresh": 0.10,
@@ -418,7 +465,14 @@ PERFORMANCE_PROFILES = {
         "bytetrack_min_iou_for_center_match": 0.01,
         "bytetrack_min_size_similarity": 0.40,
         "track_display_max_age": 1,
-        "detection_conf_scale": 0.90,
+        "detection_conf_scale": 1.00,
+        # Realtime đang ổn nên giữ filter scale = 1.0 để không làm mất xe xa.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        # Realtime chỉ tăng rất nhẹ filter motorbike ở gần để tránh nhiễu đáy ảnh.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 1.25},
         "tracker_embedder": "mobilenet",
         "display_width": 900,
         "display_height": 620,
@@ -431,10 +485,19 @@ PERFORMANCE_PROFILES = {
         "drop_frames_when_slow": True,
         "realtime_queue_size": 1,
         "cpu_thread_count": 6,
-        "bbox_thickness": 1,
+        "bbox_thickness": 2,
         "bbox_center_radius": 2,
-        "draw_track_labels": False,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.32,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.25,
+        "bbox_smooth_size_alpha": 0.70,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
         "draw_detection_labels": False,
+        "region_label_scale": 0.65,
     },
 }
 

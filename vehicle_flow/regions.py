@@ -222,7 +222,7 @@ class RegionTemplate:
             center_point=self._center_point(width, height),
         )
 
-    def overlay(self, frame):
+    def overlay(self, frame, label_scale=1.0):
         if not self.loaded:
             return
 
@@ -241,7 +241,7 @@ class RegionTemplate:
             if region_name == "center" or region_name in added:
                 continue
             polygons.append((region_name, entry["points"]))
-        draw_region_polygons(frame, polygons)
+        draw_region_polygons(frame, polygons, label_scale=label_scale)
 
 
 def _dist(a, b):
@@ -385,16 +385,22 @@ def _safe_label_center(contour, frame_width, frame_height):
     return cx, cy
 
 
-def _draw_readable_label(frame, text, center, color):
-    """Vẽ label dạng pill dễ đọc nhưng không quá chói."""
+def _draw_readable_label(frame, text, center, color, label_scale=1.0):
+    """Vẽ label dạng pill dễ đọc nhưng không quá chói.
+
+    label_scale dùng để giảm kích thước chữ khi chạy realtime ở phân giải thấp,
+    tránh che mất xe/box nhưng vẫn giữ tên vùng đủ đọc.
+    """
     x, y = center
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.50 if len(text) > 6 else 0.56
-    thickness = 2
+    label_scale = max(0.45, min(1.15, float(label_scale or 1.0)))
+    base_scale = 0.50 if len(text) > 6 else 0.56
+    scale = base_scale * label_scale
+    thickness = 1 if label_scale < 0.85 else 2
     text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
     tw, th = text_size
-    pad_x = 8
-    pad_y = 5
+    pad_x = max(4, int(8 * label_scale))
+    pad_y = max(3, int(5 * label_scale))
 
     x1 = int(x - tw / 2 - pad_x)
     y1 = int(y - th / 2 - pad_y)
@@ -419,7 +425,7 @@ def _draw_readable_label(frame, text, center, color):
 
 
 
-def draw_region_polygons(frame, polygons, alpha=0.065):
+def draw_region_polygons(frame, polygons, alpha=0.065, label_scale=1.0):
     """Vẽ nền vùng nhẹ, viền tương phản và label gọn.
 
     Không vẽ mũi tên hướng ở đây. Với 8 vùng làn, mũi tên làm overlay rối;
@@ -454,16 +460,16 @@ def draw_region_polygons(frame, polygons, alpha=0.065):
     # Vẽ label gọn sau cùng để tên vùng vẫn đọc được trên frame sáng.
     for region_name, contour, color, center in prepared:
         label = REGION_LABELS.get(region_name, REGION_SHORT_LABELS.get(region_name, region_name.upper()))
-        _draw_readable_label(frame, label, center, color)
+        _draw_readable_label(frame, label, center, color, label_scale=label_scale)
 
 
-def draw_region_overlay(frame, margin_fraction, template=None):
+def draw_region_overlay(frame, margin_fraction, template=None, label_scale=1.0):
     """
     Chỉ vẽ overlay vùng khi được gọi rõ ràng.
     Nếu không có template, vẽ vùng biên 8 làn mặc định.
     """
     if template and template.loaded:
-        template.overlay(frame)
+        template.overlay(frame, label_scale=label_scale)
         return
 
     height, width = frame.shape[:2]
@@ -484,4 +490,4 @@ def draw_region_overlay(frame, margin_fraction, template=None):
         ("b1", [(mid_x, bottom_margin), (right_margin, bottom_margin), (width - 1, height - 1), (mid_x, height - 1)]),
         ("b2", [(0, height - 1), (mid_x, height - 1), (mid_x, bottom_margin), (left_margin, bottom_margin)]),
     ]
-    draw_region_polygons(frame, polygons)
+    draw_region_polygons(frame, polygons, label_scale=label_scale)

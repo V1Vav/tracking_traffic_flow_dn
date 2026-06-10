@@ -67,7 +67,9 @@ from .config import (
     MODEL_IOU,
     PERFORMANCE_PROFILES,
     PERSPECTIVE_AREA_GAMMA,
+    PERSPECTIVE_FAR_MIN_AREA_SCALE,
     PERSPECTIVE_MIN_AREA_RATIO,
+    PERSPECTIVE_NEAR_MIN_AREA_SCALE,
     PERSPECTIVE_SIZE_FILTER_ENABLED,
     REALTIME_QUEUE_SIZE,
     REALTIME_SOURCE_PREFIXES,
@@ -344,12 +346,46 @@ def _scale_filter_pixels(value, frame_width):
         return int(value)
 
 
-def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height, conf_scale=1.0):
+def _profile_filter_scale(performance_cfg, key, cls=None, default=1.0):
+    """Đọc hệ số filter theo profile, có hỗ trợ override theo class.
+
+    Ví dụ trong PERFORMANCE_PROFILES:
+        "filter_min_box_area_scale": 1.25
+        "filter_min_box_area_scale_by_class": {3: 1.8}
+
+    Dùng để siết quality/balanced mà không ảnh hưởng realtime đang ổn.
+    """
+    if not performance_cfg:
+        return float(default)
+    value = performance_cfg.get(key, default)
+    by_class = performance_cfg.get(f"{key}_by_class")
+    if cls is not None and isinstance(by_class, dict):
+        value = by_class.get(cls, by_class.get(str(cls), value))
+    try:
+        return max(0.01, float(value))
+    except Exception:
+        return float(default)
+
+
+def _passes_detection_filters(
+    cls,
+    conf,
+    x1,
+    y1,
+    x2,
+    y2,
+    frame_width,
+    frame_height,
+    conf_scale=1.0,
+    performance_cfg=None,
+):
     """Lọc theo confidence riêng từng class và hình học tương đối để detection ổn định."""
     cls = _merge_internal_class(cls)
     if cls not in DETECT_CLASS_IDS:
         return False
 
+    # Giữ CLASS_CONF_THRESHOLDS làm nguồn chính. detection_conf_scale chỉ là
+    # hệ số tương thích cũ, mặc định các profile hiện để 1.0.
     min_conf = CLASS_CONF_THRESHOLDS.get(cls, 0.25) * float(conf_scale or 1.0)
     if conf < min_conf:
         return False
@@ -359,14 +395,17 @@ def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_heig
     if w <= 0 or h <= 0:
         return False
 
+    wh_scale = _profile_filter_scale(performance_cfg, "filter_min_box_wh_scale", cls, 1.0)
+    area_scale = _profile_filter_scale(performance_cfg, "filter_min_box_area_scale", cls, 1.0)
+
     min_w, min_h = MIN_BOX_WH.get(cls, (8, 8))
-    min_w = _scale_filter_pixels(min_w, frame_width)
-    min_h = _scale_filter_pixels(min_h, frame_width)
+    min_w = _scale_filter_pixels(min_w, frame_width) * wh_scale
+    min_h = _scale_filter_pixels(min_h, frame_width) * wh_scale
     if w < min_w or h < min_h:
         return False
 
     frame_area = max(frame_width * frame_height, 1)
-    if (w * h) / frame_area < MIN_BOX_AREA_RATIO:
+    if (w * h) / frame_area < MIN_BOX_AREA_RATIO * area_scale:
         return False
 
     aspect_ratio = w / max(h, 1)
@@ -377,7 +416,7 @@ def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_heig
     return True
 
 
-def _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_width, frame_height):
+def _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_width, frame_height, performance_cfg=None):
     """Lọc bbox quá nhỏ ở vùng gần camera theo phối cảnh ảnh 2D.
 
     Không có depth thật nên dùng y2/frame_height làm proxy:
@@ -407,7 +446,27 @@ def _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_width, frame_heig
 
     gamma = max(float(PERSPECTIVE_AREA_GAMMA or 1.0), 0.01)
     t = bottom_ratio ** gamma
-    required_area_ratio = far_min + (near_min - far_min) * t
+
+    # Giữ tương thích với key cũ perspective_min_area_scale, nhưng ưu tiên
+    # far/near scale riêng nếu profile khai báo. Nhờ vậy có thể siết vùng gần
+    # camera mà không làm mất xe máy nhỏ ở xa.
+    base_scale = _profile_filter_scale(performance_cfg, "perspective_min_area_scale", cls, 1.0)
+    far_scale = _profile_filter_scale(
+        performance_cfg,
+        "perspective_far_min_area_scale",
+        cls,
+        float(PERSPECTIVE_FAR_MIN_AREA_SCALE) * base_scale,
+    )
+    near_scale = _profile_filter_scale(
+        performance_cfg,
+        "perspective_near_min_area_scale",
+        cls,
+        float(PERSPECTIVE_NEAR_MIN_AREA_SCALE) * base_scale,
+    )
+
+    far_required = far_min * far_scale
+    near_required = near_min * near_scale
+    required_area_ratio = far_required + (near_required - far_required) * t
 
     return area_ratio >= required_area_ratio
 
@@ -628,6 +687,102 @@ def _track_ltrb(track):
         box = track.to_ltrb()
     l, t, r, b = map(int, box)
     return l, t, r, b
+
+
+def _clamp01(value):
+    return max(0.0, min(1.0, float(value)))
+
+
+def _bbox_center_size(box):
+    x1, y1, x2, y2 = [float(v) for v in box]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    return x1 + w * 0.5, y1 + h * 0.5, w, h
+
+
+def _center_size_to_ltrb(cx, cy, w, h, frame_width, frame_height):
+    w = max(1.0, float(w))
+    h = max(1.0, float(h))
+    x1 = cx - w * 0.5
+    y1 = cy - h * 0.5
+    x2 = cx + w * 0.5
+    y2 = cy + h * 0.5
+
+    # Clamp trong frame. Nếu bbox sát mép, clamp trực tiếp để tránh tọa độ âm.
+    x1 = max(0.0, min(float(frame_width - 1), x1))
+    y1 = max(0.0, min(float(frame_height - 1), y1))
+    x2 = max(0.0, min(float(frame_width - 1), x2))
+    y2 = max(0.0, min(float(frame_height - 1), y2))
+
+    if x2 <= x1:
+        x2 = min(float(frame_width - 1), x1 + 1.0)
+    if y2 <= y1:
+        y2 = min(float(frame_height - 1), y1 + 1.0)
+    return int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
+
+
+def _smooth_track_bbox(meta, raw_box, frame_width, frame_height, performance_cfg=None, cls=None):
+    """Làm mượt bbox theo track để giảm co giãn/nhấp nháy kích thước.
+
+    YOLO có thể thay đổi bbox từng frame, nhất là xe máy: frame này ôm thân xe,
+    frame sau ôm cả kính/ghi-đông. Nếu đưa thẳng bbox đó ra display/region, viền
+    sẽ co giãn liên tục. Hàm này làm mượt tâm nhẹ và làm mượt kích thước mạnh hơn.
+    """
+    cfg = performance_cfg or {}
+    if not bool(cfg.get("bbox_smoothing_enabled", False)):
+        meta.pop("smooth_box", None)
+        meta.pop("smooth_box_cls", None)
+        return tuple(map(int, raw_box))
+
+    raw_box = tuple(map(float, raw_box))
+    if _area(raw_box) <= 0:
+        return tuple(map(int, raw_box))
+
+    prev_box = meta.get("smooth_box")
+    prev_cls = meta.get("smooth_box_cls")
+    if cls is not None and prev_cls is not None and int(prev_cls) != int(cls):
+        prev_box = None
+
+    if prev_box is not None:
+        prev_box = tuple(map(float, prev_box))
+        iou_score = _iou(raw_box, prev_box)
+        center_ratio = _center_distance_ratio(raw_box, prev_box)
+        reset_iou = float(cfg.get("bbox_smooth_reset_iou", 0.08) or 0.08)
+        reset_center_ratio = float(cfg.get("bbox_smooth_reset_center_ratio", 1.4) or 1.4)
+        # Nếu bbox nhảy quá xa và gần như không còn overlap, xem như ID/object đổi,
+        # reset để không kéo bbox cũ sang vật thể mới.
+        if iou_score < reset_iou and center_ratio > reset_center_ratio:
+            prev_box = None
+
+    if prev_box is None:
+        meta["smooth_box"] = raw_box
+        if cls is not None:
+            meta["smooth_box_cls"] = int(cls)
+        return tuple(map(int, raw_box))
+
+    cx, cy, w, h = _bbox_center_size(raw_box)
+    pcx, pcy, pw, ph = _bbox_center_size(prev_box)
+
+    center_alpha = _clamp01(cfg.get("bbox_smooth_center_alpha", 0.25))
+    size_alpha = _clamp01(cfg.get("bbox_smooth_size_alpha", 0.70))
+
+    smooth_cx = center_alpha * pcx + (1.0 - center_alpha) * cx
+    smooth_cy = center_alpha * pcy + (1.0 - center_alpha) * cy
+    smooth_w = size_alpha * pw + (1.0 - size_alpha) * w
+    smooth_h = size_alpha * ph + (1.0 - size_alpha) * h
+
+    smooth_box = _center_size_to_ltrb(
+        smooth_cx,
+        smooth_cy,
+        smooth_w,
+        smooth_h,
+        frame_width,
+        frame_height,
+    )
+    meta["smooth_box"] = tuple(map(float, smooth_box))
+    if cls is not None:
+        meta["smooth_box_cls"] = int(cls)
+    return smooth_box
 
 
 def _box_near_frame_edge(box, frame_width, frame_height):
@@ -1245,6 +1400,14 @@ def process_video(app, video_path, model_path):
         bbox_thickness = max(1, int(performance_cfg.get("bbox_thickness", 2)))
         bbox_center_radius = max(0, int(performance_cfg.get("bbox_center_radius", 3)))
         draw_track_labels = bool(performance_cfg.get("draw_track_labels", False))
+        draw_track_class_name = bool(performance_cfg.get("draw_track_class_name", True))
+        track_label_font_scale = float(performance_cfg.get("track_label_font_scale", 0.5) or 0.5)
+        raw_track_label_thickness = performance_cfg.get("track_label_thickness", "bbox")
+        if isinstance(raw_track_label_thickness, str) and raw_track_label_thickness.lower() in {"bbox", "same", "auto"}:
+            track_label_thickness = max(1, bbox_thickness)
+        else:
+            track_label_thickness = max(1, int(raw_track_label_thickness or bbox_thickness))
+        region_label_scale = float(performance_cfg.get("region_label_scale", 1.0) or 1.0)
         draw_detection_labels = bool(performance_cfg.get("draw_detection_labels", False))
         profile_resolution_name = str(performance_cfg.get("profile_resolution_name", ""))
 
@@ -1518,14 +1681,21 @@ def process_video(app, video_path, model_path):
                         x2 = max(0, min(x2, frame_w - 1))
                         y2 = max(0, min(y2, frame_h - 1))
 
-                        if not _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_w, frame_h, conf_scale=detection_conf_scale):
+                        if not _passes_detection_filters(
+                            cls, conf, x1, y1, x2, y2, frame_w, frame_h,
+                            conf_scale=detection_conf_scale,
+                            performance_cfg=performance_cfg,
+                        ):
                             continue
 
                         x1, y1, x2, y2 = _expand_bbox_by_class(
                             cls, x1, y1, x2, y2, frame_w, frame_h
                         )
 
-                        if not _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_w, frame_h):
+                        if not _passes_perspective_size_filter(
+                            cls, x1, y1, x2, y2, frame_w, frame_h,
+                            performance_cfg=performance_cfg,
+                        ):
                             continue
 
                         w, h = x2 - x1, y2 - y1
@@ -1667,7 +1837,7 @@ def process_video(app, video_path, model_path):
 
             for track in primary_tracks:
                 track_id = track.track_id
-                l, t, r, b = _track_ltrb(track)
+                raw_l, raw_t, raw_r, raw_b = _track_ltrb(track)
                 det_cls = getattr(track, "det_class", None)
                 det_conf = getattr(track, "det_conf", None)
                 if det_cls is None:
@@ -1677,13 +1847,25 @@ def process_video(app, video_path, model_path):
                     continue
 
                 active_tracks += 1
+                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
+                # Làm mượt bbox sau tracker để giảm hiện tượng bbox co giãn liên tục.
+                # Tâm bbox chỉ làm mượt nhẹ, kích thước làm mượt mạnh hơn nên ít lag hơn
+                # so với việc smooth toàn bộ tọa độ đều nhau.
+                l, t, r, b = _smooth_track_bbox(
+                    meta,
+                    (raw_l, raw_t, raw_r, raw_b),
+                    frame_w,
+                    frame_h,
+                    performance_cfg=performance_cfg,
+                    cls=int(det_cls),
+                )
+
                 # Dùng điểm giữa cạnh dưới bbox để xác định vùng trên mặt đường.
                 # Tâm bbox vẫn hữu ích để vẽ box, nhưng dễ lệch vùng khi camera nhìn chéo.
                 region_point = region_point_from_box(
                     (l, t, r, b),
                     use_bottom_center=USE_BOTTOM_CENTER_FOR_REGION,
                 )
-                meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
                 previous_region_point = meta.get("last_region_point")
                 previous_region = meta.get("current_region") or meta.get("stable_region")
                 raw_region = get_direction_region(
@@ -1824,11 +2006,30 @@ def process_video(app, video_path, model_path):
 
                     cv2.rectangle(display_frame, (l, t), (r, b), color, bbox_thickness)
                     if draw_track_labels:
-                        label = f"{_class_display_name(cls)} #{track_id}"
+                        # Không hiện tên class trên ảnh để giảm rối. Chỉ hiện ID và vùng,
+                        # ví dụ: ID12.t1. Màu bbox thể hiện class và chú thích nằm ở panel bên phải.
+                        label_parts = []
+                        if draw_track_class_name:
+                            label_parts.append(_class_display_name(cls))
+
                         region_label = stable_region if stable_region is not None else raw_region
+                        # Rút gọn text để không dài hơn bbox xe nhỏ.
+                        # Format: ID12.t1 thay vì ID 12 - t1.
+                        id_region_label = f"ID{track_id}"
                         if region_label:
-                            label += f" {region_label}"
-                        cv2.putText(display_frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, max(1, bbox_thickness))
+                            id_region_label = f"{id_region_label}.{region_label}"
+                        label_parts.append(id_region_label)
+
+                        label = " ".join(label_parts)
+                        cv2.putText(
+                            display_frame,
+                            label,
+                            (l, max(14, t - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            track_label_font_scale,
+                            color,
+                            track_label_thickness,
+                        )
                     if bbox_center_radius > 0:
                         cv2.circle(display_frame, region_point, bbox_center_radius, color, -1)
 
@@ -1842,7 +2043,7 @@ def process_video(app, video_path, model_path):
                     )
 
             if should_update_display and display_frame is not None and app.display_template_var.get():
-                draw_region_overlay(display_frame, app.region_margin, app.region_template)
+                draw_region_overlay(display_frame, app.region_margin, app.region_template, label_scale=region_label_scale)
 
             cleanup_flow_windows(branch_event_windows, current_time, app.flow_window)
 
