@@ -9,6 +9,11 @@ from .config import (
     CLASS_WEIGHTS,
     COUNTED_CLASS_IDS,
     EVENT_COOLDOWN_FRAMES,
+    FLUID_INFER_MISSING_CENTER,
+    FLUID_INFERRED_CENTER_CONFIDENCE,
+    FLUID_TRANSITION_COOLDOWN_FRAMES,
+    INBOUND_LANE_REGIONS,
+    OUTBOUND_LANE_REGIONS,
     MIN_CLASS_VOTES,
     CLASS_SWITCH_MIN_VOTES,
     CLASS_SWITCH_RATIO,
@@ -29,6 +34,13 @@ def create_track_meta(frame_id, cls):
         "current_region": None,
         "last_box": None,
         "duplicate_of": None,
+        "last_fluid_region": None,
+        "last_fluid_region_time": None,
+        "last_validated_transition_frame": -10**9,
+        "fluid_origin_region": None,
+        "fluid_passed_center": False,
+        "fluid_done": False,
+        "fluid_rejected_transition_count": 0,
         "weight": CLASS_WEIGHTS.get(cls, 0.0),
         "cls": cls,
         "stable_cls": cls,
@@ -112,6 +124,105 @@ def update_stable_region(meta, raw_region):
         meta["stable_region"] = recent[0]
 
     return meta["stable_region"]
+
+
+def is_valid_fluid_transition(from_region, to_region):
+    """Cạnh hợp lệ trong mô hình 8 làn: inbound->center hoặc center->outbound."""
+    return (
+        from_region in INBOUND_LANE_REGIONS and to_region == "center"
+    ) or (
+        from_region == "center" and to_region in OUTBOUND_LANE_REGIONS
+    )
+
+
+def _transition_on_cooldown(meta, frame_id):
+    last_frame = meta.get("last_validated_transition_frame", -10**9)
+    return frame_id - last_frame < FLUID_TRANSITION_COOLDOWN_FRAMES
+
+
+def _mark_transition_accepted(meta, frame_id):
+    meta["last_validated_transition_frame"] = frame_id
+
+
+def resolve_validated_fluid_transitions(meta, from_region, to_region, frame_id, current_time):
+    """Lọc và chuẩn hóa transition trước khi ghi CSV flow/OD.
+
+    YOLO/DeepSORT có thể làm bbox rung ở mép polygon, mất vài frame trong center
+    hoặc tạo hướng ngược như center->inbound, outbound->center. Hàm này chỉ cho
+    qua luồng hợp lệ inbound->center->outbound. Nếu track nhảy trực tiếp từ
+    inbound sang outbound, có thể suy luận center bị bỏ lỡ và tách thành hai
+    cạnh hợp lệ để replay/RL không còn nhận lane_to_lane_direct.
+    """
+    if not from_region or not to_region or from_region == to_region:
+        return []
+
+    if meta.get("fluid_done"):
+        meta["fluid_rejected_transition_count"] = meta.get("fluid_rejected_transition_count", 0) + 1
+        return []
+
+    if _transition_on_cooldown(meta, frame_id):
+        meta["fluid_rejected_transition_count"] = meta.get("fluid_rejected_transition_count", 0) + 1
+        return []
+
+    if from_region in INBOUND_LANE_REGIONS and to_region == "center":
+        meta["fluid_origin_region"] = from_region
+        meta["fluid_passed_center"] = True
+        _mark_transition_accepted(meta, frame_id)
+        return [{
+            "from_region": from_region,
+            "to_region": to_region,
+            "time_s": current_time,
+            "source": "observed",
+            "confidence": 1.0,
+            "reason": "validated_inbound_to_center",
+        }]
+
+    if from_region == "center" and to_region in OUTBOUND_LANE_REGIONS:
+        meta["fluid_done"] = True
+        _mark_transition_accepted(meta, frame_id)
+        return [{
+            "from_region": from_region,
+            "to_region": to_region,
+            "time_s": current_time,
+            "source": "observed",
+            "confidence": 1.0,
+            "reason": "validated_center_to_outbound",
+        }]
+
+    if (
+        FLUID_INFER_MISSING_CENTER
+        and from_region in INBOUND_LANE_REGIONS
+        and to_region in OUTBOUND_LANE_REGIONS
+    ):
+        last_time = meta.get("last_fluid_region_time")
+        if last_time is None:
+            last_time = current_time
+        mid_time = max(0.0, (float(last_time) + float(current_time)) * 0.5)
+        meta["fluid_origin_region"] = from_region
+        meta["fluid_passed_center"] = True
+        meta["fluid_done"] = True
+        _mark_transition_accepted(meta, frame_id)
+        return [
+            {
+                "from_region": from_region,
+                "to_region": "center",
+                "time_s": mid_time,
+                "source": "inferred",
+                "confidence": FLUID_INFERRED_CENTER_CONFIDENCE,
+                "reason": "inferred_center_missing_part1",
+            },
+            {
+                "from_region": "center",
+                "to_region": to_region,
+                "time_s": current_time,
+                "source": "inferred",
+                "confidence": FLUID_INFERRED_CENTER_CONFIDENCE,
+                "reason": "inferred_center_missing_part2",
+            },
+        ]
+
+    meta["fluid_rejected_transition_count"] = meta.get("fluid_rejected_transition_count", 0) + 1
+    return []
 
 
 def can_emit_event(meta, branch, direction, frame_id):

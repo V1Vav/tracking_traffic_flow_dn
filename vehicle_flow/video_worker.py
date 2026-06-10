@@ -14,14 +14,23 @@ try:
     import torch
 except Exception:  # pragma: no cover - torch thường được cài cùng ultralytics
     torch = None
-from deep_sort_realtime.deepsort_tracker import DeepSort
+try:
+    from deep_sort_realtime.deepsort_tracker import DeepSort
+except Exception:
+    DeepSort = None
 from ultralytics.models import YOLO
+
+from .bytetrack_lite import ByteTrackLite
 
 from .config import (
     BRANCH_ORDER,
     CLASS_ASPECT_RATIO_LIMITS,
+    CLASS_BBOX_EXPAND_RATIO,
     CLASS_COLORS,
     CLASS_CONF_THRESHOLDS,
+    CLASS_DISPLAY_NAME_OVERRIDE,
+    CLASS_DISPLAY_NAMES,
+    CLASS_MERGE_MAP,
     CLASS_NAMES,
     CLASS_WEIGHTS,
     ASYNC_DISPLAY_CONVERSION,
@@ -45,13 +54,21 @@ from .config import (
     DEFAULT_PERFORMANCE_PROFILE,
     EXPECTED_MODEL_NAMES,
     FILE_QUEUE_SECONDS,
+    FILTER_REFERENCE_WIDTH,
     LOST_OUT_FRAMES,
     MIN_BOX_AREA_RATIO,
     MIN_BOX_WH,
+    MOTORBIKE_PART_CLASS_ID,
+    MOTORBIKE_PART_MAX_AREA_RATIO,
+    MOTORBIKE_PART_MIN_IOA,
+    MOTORBIKE_PART_SUPPRESSION_ENABLED,
     MODEL_CONF,
     MODEL_IMGSZ,
     MODEL_IOU,
     PERFORMANCE_PROFILES,
+    PERSPECTIVE_AREA_GAMMA,
+    PERSPECTIVE_MIN_AREA_RATIO,
+    PERSPECTIVE_SIZE_FILTER_ENABLED,
     REALTIME_QUEUE_SIZE,
     REALTIME_SOURCE_PREFIXES,
     TRACK_COUNT_HOLD_FRAMES,
@@ -66,6 +83,8 @@ from .config import (
     TRACK_STALE_MERGE_FRAMES,
     TORCH_INTEROP_THREADS,
     TARGET_PROCESS_FPS,
+    REALTIME_FPS_LOCK_MAX,
+    USE_BOTTOM_CENTER_FOR_REGION,
     USE_CPU_THREADS,
     VALID_BRANCHES,
     YOLO_WARMUP,
@@ -77,31 +96,146 @@ from .flow_logic import (
     emit_branch_event,
     mark_branch_enter,
     mark_branch_exit,
+    resolve_validated_fluid_transitions,
     update_stable_class,
     update_stable_region,
 )
-from .regions import centroid_from_box, draw_region_overlay, get_direction_region
+from .regions import draw_region_overlay, get_direction_region, region_point_from_box
 from .fluid_export import FluidFlowExporter
+
+
+def _normalize_class_name(name):
+    """Chuẩn hóa tên class để ghép model YOLO với class nội bộ.
+
+    Các model fine-tune trong project từng có nhiều thứ tự nhãn khác nhau
+    như motorcycle/person/license plate. Vì vậy không được giả định id YOLO
+    luôn trùng với id trong config.py.
+    """
+    text = str(name).strip().lower()
+    text = text.replace("_", " ").replace("-", " ")
+    return " ".join(text.split())
 
 
 def _normalize_model_names(names):
     if isinstance(names, dict):
-        return {int(k): str(v).lower() for k, v in names.items()}
-    return {idx: str(name).lower() for idx, name in enumerate(names)}
+        return {int(k): _normalize_class_name(v) for k, v in names.items()}
+    return {idx: _normalize_class_name(name) for idx, name in enumerate(names)}
 
 
-def _validate_model_class_mapping(model):
-    """Cảnh báo sớm nếu thứ tự class của model fine-tune khác config.py."""
+_CLASS_NAME_ALIASES = {
+    "bus": 0,
+    "coach": 0,
+    "car": 1,
+    "auto": 1,
+    "automobile": 1,
+    "motorbike": 2,
+    "motorcycle": 2,
+    "motor": 2,
+    "moto": 2,
+    "bike motor": 2,
+    "pedestrian": 3,
+    "person": 3,
+    "people": 3,
+    "human": 3,
+    "truck": 4,
+    "lorry": 4,
+}
+
+_IGNORED_MODEL_CLASS_NAMES = {
+    "license plate",
+    "licence plate",
+    "plate",
+    "number plate",
+    "bicycle",
+    "bike",
+}
+
+
+def _merge_internal_class(cls):
+    """Gộp class nội bộ sau YOLO, trước filter/tracker/count."""
+    try:
+        cls = int(cls)
+    except Exception:
+        return cls
+    return int(CLASS_MERGE_MAP.get(cls, cls))
+
+
+def _class_display_name(cls):
+    """Tên hiển thị sau khi đã merge class."""
+    try:
+        cls = int(cls)
+    except Exception:
+        return str(cls)
+    return CLASS_DISPLAY_NAME_OVERRIDE.get(cls, CLASS_DISPLAY_NAMES.get(cls, CLASS_NAMES.get(cls, str(cls))))
+
+
+def _build_model_class_map(model):
+    """Map id class thật của YOLO -> id class nội bộ của ứng dụng.
+
+    Trả về:
+    - model_to_internal: ví dụ model id 3='motorbike' -> internal id 2
+    - ignored: các class biết nhưng không dùng như license plate/bicycle
+    - unknown: class lạ cần cảnh báo
+    """
     model_names = _normalize_model_names(getattr(model, "names", {}))
-    expected = {idx: name.lower() for idx, name in EXPECTED_MODEL_NAMES.items()}
-    mismatches = []
+    if not model_names:
+        # Fallback cho model rất cũ không có names: dùng mapping theo id như config.
+        return {idx: idx for idx in DETECT_CLASS_IDS}, {}, {}
 
-    for idx, expected_name in expected.items():
+    model_to_internal = {}
+    ignored = {}
+    unknown = {}
+    for model_cls, name in model_names.items():
+        if name in _CLASS_NAME_ALIASES:
+            model_to_internal[model_cls] = _CLASS_NAME_ALIASES[name]
+        elif name in _IGNORED_MODEL_CLASS_NAMES:
+            ignored[model_cls] = name
+        else:
+            unknown[model_cls] = name
+
+    # Nếu không map được class nào, fallback id cũ để app vẫn chạy thay vì mất detect hoàn toàn.
+    if not model_to_internal:
+        model_to_internal = {idx: idx for idx in DETECT_CLASS_IDS}
+
+    return model_to_internal, ignored, unknown
+
+
+def _validate_model_class_mapping(model, model_to_internal=None, ignored=None, unknown=None):
+    """Thông báo mapping class. Không coi thứ tự id khác nhau là lỗi nếu map được theo tên."""
+    model_names = _normalize_model_names(getattr(model, "names", {}))
+    model_to_internal = model_to_internal or {}
+    ignored = ignored or {}
+    unknown = unknown or {}
+
+    messages = []
+    exact_order_ok = True
+    for idx, expected_name in EXPECTED_MODEL_NAMES.items():
         actual_name = model_names.get(idx)
-        if actual_name != expected_name:
-            mismatches.append(f"id {idx}: kỳ_vọng={expected_name}, thực_tế={actual_name}")
+        if actual_name != _normalize_class_name(expected_name):
+            exact_order_ok = False
+            break
 
-    return mismatches
+    if not exact_order_ok and model_to_internal:
+        pairs = []
+        for model_cls, internal_cls in sorted(model_to_internal.items()):
+            model_name = model_names.get(model_cls, str(model_cls))
+            internal_name = CLASS_NAMES.get(internal_cls, str(internal_cls))
+            pairs.append(f"model id {model_cls}={model_name} -> {internal_name}")
+        messages.append("Auto map class theo tên: " + ", ".join(pairs))
+
+    if ignored:
+        messages.append(
+            "Bỏ qua class không dùng: "
+            + ", ".join(f"id {idx}={name}" for idx, name in sorted(ignored.items()))
+        )
+
+    if unknown:
+        messages.append(
+            "Class lạ chưa map: "
+            + ", ".join(f"id {idx}={name}" for idx, name in sorted(unknown.items()))
+        )
+
+    return messages
 
 
 def _is_realtime_source(source):
@@ -138,12 +272,28 @@ def _sanitize_capture_fps(raw_fps, fallback=30.0):
 
 
 def _resolve_target_process_fps(source_fps, performance_cfg=None):
-    """Xác định FPS đưa vào YOLO/DeepSORT sau khi giảm FPS nguồn."""
+    """Xác định FPS xử lý thực tế.
+
+    Với profile realtime có lock_to_source_fps=True:
+    - video/camera < fps_lock_max thì giữ đúng FPS nguồn;
+    - video/camera > fps_lock_max thì lấy mẫu xuống fps_lock_max.
+
+    Ví dụ fps_lock_max=30: video 24/25 FPS chạy 24/25 FPS, video
+    50/60 FPS chạy tối đa 30 FPS.
+    """
     cfg = performance_cfg or {}
     try:
         requested = float(cfg.get("target_process_fps", TARGET_PROCESS_FPS))
     except Exception:
         requested = float(TARGET_PROCESS_FPS)
+
+    if bool(cfg.get("lock_to_source_fps", False)):
+        try:
+            fps_lock_max = float(cfg.get("fps_lock_max", REALTIME_FPS_LOCK_MAX))
+        except Exception:
+            fps_lock_max = float(REALTIME_FPS_LOCK_MAX)
+        if fps_lock_max > 0:
+            requested = fps_lock_max
 
     if (not ENABLE_SOURCE_FPS_DOWNSAMPLE) or requested <= 0:
         return float(source_fps), False
@@ -179,12 +329,28 @@ def _put_frame(frame_queue, frame, drop_old_frames, stop_event):
             except Empty:
                 pass
 
-def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height):
+def _scale_filter_pixels(value, frame_width):
+    """Scale ngưỡng pixel theo độ rộng frame xử lý.
+
+    MIN_BOX_WH được khai báo ở mốc FILTER_REFERENCE_WIDTH=960. Nếu quality
+    chạy 1280p mà vẫn dùng ngưỡng 960p, nhiễu nhỏ sẽ dễ lọt qua. Nếu realtime
+    chạy 736p mà vẫn dùng ngưỡng 960p, xe nhỏ ở xa lại dễ bị loại nhầm.
+    """
+    try:
+        ref = float(FILTER_REFERENCE_WIDTH or 960)
+        scale = float(frame_width) / max(ref, 1.0)
+        return max(1, int(round(float(value) * scale)))
+    except Exception:
+        return int(value)
+
+
+def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_height, conf_scale=1.0):
     """Lọc theo confidence riêng từng class và hình học tương đối để detection ổn định."""
+    cls = _merge_internal_class(cls)
     if cls not in DETECT_CLASS_IDS:
         return False
 
-    min_conf = CLASS_CONF_THRESHOLDS.get(cls, 0.25)
+    min_conf = CLASS_CONF_THRESHOLDS.get(cls, 0.25) * float(conf_scale or 1.0)
     if conf < min_conf:
         return False
 
@@ -194,6 +360,8 @@ def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_heig
         return False
 
     min_w, min_h = MIN_BOX_WH.get(cls, (8, 8))
+    min_w = _scale_filter_pixels(min_w, frame_width)
+    min_h = _scale_filter_pixels(min_h, frame_width)
     if w < min_w or h < min_h:
         return False
 
@@ -207,6 +375,64 @@ def _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_width, frame_heig
         return False
 
     return True
+
+
+def _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_width, frame_height):
+    """Lọc bbox quá nhỏ ở vùng gần camera theo phối cảnh ảnh 2D.
+
+    Không có depth thật nên dùng y2/frame_height làm proxy:
+    - bbox có đáy gần phía trên ảnh được xem là xa camera, min_area thấp.
+    - bbox có đáy gần phía dưới ảnh được xem là gần camera, min_area cao.
+    """
+    if not PERSPECTIVE_SIZE_FILTER_ENABLED:
+        return True
+
+    cls = _merge_internal_class(cls)
+    rule = PERSPECTIVE_MIN_AREA_RATIO.get(cls)
+    if rule is None:
+        return True
+
+    try:
+        far_min, near_min = float(rule[0]), float(rule[1])
+    except Exception:
+        return True
+
+    w = max(0.0, float(x2 - x1))
+    h = max(0.0, float(y2 - y1))
+    frame_area = max(float(frame_width * frame_height), 1.0)
+    area_ratio = (w * h) / frame_area
+
+    bottom_ratio = float(y2) / max(float(frame_height), 1.0)
+    bottom_ratio = max(0.0, min(1.0, bottom_ratio))
+
+    gamma = max(float(PERSPECTIVE_AREA_GAMMA or 1.0), 0.01)
+    t = bottom_ratio ** gamma
+    required_area_ratio = far_min + (near_min - far_min) * t
+
+    return area_ratio >= required_area_ratio
+
+
+def _expand_bbox_by_class(cls, x1, y1, x2, y2, frame_width, frame_height):
+    """Mở rộng bbox theo class sau khi đã qua filter cơ bản.
+
+    Đặc biệt hữu ích với motorbike: bbox YOLO có thể chỉ ôm thân xe, khiến
+    kính/ghi-đông phía trên bị detect thành một motorbike nhỏ khác. Mở rộng
+    lên phía trên trước khi tracking giúp các phần này nằm trong cùng một box.
+    """
+    ratio = CLASS_BBOX_EXPAND_RATIO.get(int(cls))
+    if not ratio:
+        return x1, y1, x2, y2
+
+    left_r, top_r, right_r, bottom_r = ratio
+    w = max(1.0, float(x2 - x1))
+    h = max(1.0, float(y2 - y1))
+
+    nx1 = max(0.0, float(x1) - w * float(left_r))
+    ny1 = max(0.0, float(y1) - h * float(top_r))
+    nx2 = min(float(frame_width - 1), float(x2) + w * float(right_r))
+    ny2 = min(float(frame_height - 1), float(y2) + h * float(bottom_r))
+
+    return int(round(nx1)), int(round(ny1)), int(round(nx2)), int(round(ny2))
 
 
 def _xywh_to_ltrb(box):
@@ -336,15 +562,71 @@ def _suppress_duplicate_detections(detections):
     return kept
 
 
-def _track_is_usable(track):
-    # DeepSORT có thể giữ track nội bộ rất lâu, nhưng vẽ/đếm
-    # box cũ sẽ gây đúng hiện tượng trong ảnh: nhiều ID còn nằm
-    # quanh cùng một xe. Chỉ track mới được dùng để hiển thị/đếm.
-    return track.is_confirmed() and track.time_since_update <= TRACK_DISPLAY_MAX_AGE
+def _suppress_motorbike_part_detections(detections):
+    """Xóa box motorbike nhỏ nằm trong box motorbike lớn hơn.
+
+    Hàm này chạy sau bước mở rộng bbox. Nó ưu tiên giữ box lớn hơn thay vì
+    confidence cao hơn, vì box kính/ghi-đông đôi khi có confidence cao nhưng
+    không phải là một xe riêng.
+    """
+    if (not MOTORBIKE_PART_SUPPRESSION_ENABLED) or len(detections) <= 1:
+        return detections
+
+    motorbike_cls = int(MOTORBIKE_PART_CLASS_ID)
+    motorbike_dets = [det for det in detections if int(det[2]) == motorbike_cls]
+    if len(motorbike_dets) <= 1:
+        return detections
+
+    other_dets = [det for det in detections if int(det[2]) != motorbike_cls]
+
+    # Giữ box lớn trước; nếu diện tích gần nhau thì ưu tiên confidence cao hơn.
+    sorted_motorbikes = sorted(
+        motorbike_dets,
+        key=lambda det: (_area(_xywh_to_ltrb(det[0])), float(det[1])),
+        reverse=True,
+    )
+
+    kept = []
+    for det in sorted_motorbikes:
+        box = _xywh_to_ltrb(det[0])
+        area = max(_area(box), 1)
+        is_part_box = False
+
+        for kept_det in kept:
+            kept_box = _xywh_to_ltrb(kept_det[0])
+            kept_area = max(_area(kept_box), 1)
+            if area >= kept_area * float(MOTORBIKE_PART_MAX_AREA_RATIO):
+                continue
+
+            ioa = _intersection_area(box, kept_box) / float(area)
+            if ioa >= float(MOTORBIKE_PART_MIN_IOA):
+                is_part_box = True
+                break
+
+        if not is_part_box:
+            kept.append(det)
+
+    return other_dets + kept
+
+
+def _track_is_usable(track, display_max_age=None):
+    # DeepSORT/ByteTrack có thể giữ track nội bộ lâu, nhưng vẽ/đếm bbox dự đoán
+    # quá cũ sẽ gây hiện tượng 1 xe có 2 box: box detection thật quanh xe và
+    # ghost box bị kéo phía sau. Realtime có thể override display_max_age=0 để
+    # chỉ vẽ track vừa match detection ở frame hiện tại.
+    if display_max_age is None:
+        display_max_age = TRACK_DISPLAY_MAX_AGE
+    return track.is_confirmed() and track.time_since_update <= int(display_max_age)
 
 
 def _track_ltrb(track):
-    l, t, r, b = map(int, track.to_ltrb())
+    # deep-sort-realtime hỗ trợ orig=True để lấy bbox detection gốc ở frame hiện tại;
+    # nếu frame không có detection tương ứng, orig_strict=False sẽ fallback về Kalman.
+    try:
+        box = track.to_ltrb(orig=True, orig_strict=False)
+    except TypeError:
+        box = track.to_ltrb()
+    l, t, r, b = map(int, box)
     return l, t, r, b
 
 
@@ -452,9 +734,9 @@ def _track_sort_key(track, track_meta):
     )
 
 
-def _suppress_duplicate_tracks(tracks, track_meta):
+def _suppress_duplicate_tracks(tracks, track_meta, display_max_age=None):
     """Trả về các track chính còn mới và ID track trùng cần bỏ qua/xóa."""
-    fresh_tracks = [track for track in tracks if _track_is_usable(track)]
+    fresh_tracks = [track for track in tracks if _track_is_usable(track, display_max_age=display_max_age)]
     if len(fresh_tracks) <= 1:
         return fresh_tracks, set()
 
@@ -567,6 +849,38 @@ def _is_detect_cls(cls):
         return False
 
 
+def _resolve_detect_internal_class_ids(performance_cfg=None):
+    """Lấy danh sách class nội bộ cần detect theo profile hiệu năng.
+
+    Trả về None nghĩa là KHÔNG truyền tham số classes vào YOLO. Đây là chế độ
+    an toàn nhất cho realtime khi model fine-tune có thứ tự nhãn khác nhau.
+    Nếu cấu hình là một tuple/list id nội bộ, worker sẽ map sang id thật của YOLO
+    theo model.names.
+    """
+    if performance_cfg is None or "detect_class_ids" not in performance_cfg:
+        return tuple(DETECT_CLASS_IDS)
+    raw_value = performance_cfg.get("detect_class_ids")
+    if raw_value is None:
+        return None
+    try:
+        return tuple(int(v) for v in raw_value)
+    except Exception:
+        return tuple(DETECT_CLASS_IDS)
+
+
+def _resolve_model_detect_class_ids(model_to_internal, detect_internal_class_ids):
+    """Đổi danh sách class nội bộ sang id class thật của model để truyền vào YOLO."""
+    if detect_internal_class_ids is None:
+        # None = detect tất cả class của model, rồi lọc/map sau YOLO.
+        return None
+    wanted = set(detect_internal_class_ids or DETECT_CLASS_IDS)
+    model_ids = [model_cls for model_cls, internal_cls in model_to_internal.items() if internal_cls in wanted]
+    if not model_ids:
+        # Không truyền classes=[] vì Ultralytics sẽ trả rỗng; để YOLO detect hết rồi lọc sau.
+        return None
+    return tuple(sorted(model_ids))
+
+
 def _fluid_export_enabled(app):
     try:
         return bool(app.export_fluid_var.get())
@@ -649,6 +963,43 @@ def _configure_runtime(performance_cfg=None):
     return cpu_threads
 
 
+def _get_display_target_size(app, fallback_width, fallback_height):
+    """Lấy kích thước vùng video đã được Tkinter cập nhật ở main thread."""
+    width = int(fallback_width or 0)
+    height = int(fallback_height or 0)
+    try:
+        with app.state_lock:
+            current_width, current_height = getattr(app, "video_display_size", (width, height))
+        if int(current_width) > 1 and int(current_height) > 1:
+            width, height = int(current_width), int(current_height)
+    except Exception:
+        pass
+    return max(1, width), max(1, height)
+
+
+def _resize_keep_aspect_rgb(rgb_frame, target_width, target_height):
+    """Resize preview giữ nguyên tỉ lệ, padding nền đen nếu khung dư."""
+    if rgb_frame is None or target_width <= 0 or target_height <= 0:
+        return rgb_frame
+
+    src_height, src_width = rgb_frame.shape[:2]
+    if src_width <= 0 or src_height <= 0:
+        return rgb_frame
+
+    scale = min(target_width / src_width, target_height / src_height)
+    new_width = max(1, int(round(src_width * scale)))
+    new_height = max(1, int(round(src_height * scale)))
+
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(rgb_frame, (new_width, new_height), interpolation=interpolation)
+
+    canvas = np.full((target_height, target_width, 3), (2, 6, 23), dtype=np.uint8)
+    x0 = (target_width - new_width) // 2
+    y0 = (target_height - new_height) // 2
+    canvas[y0:y0 + new_height, x0:x0 + new_width] = resized
+    return canvas
+
+
 def _put_display_frame(display_queue, display_frame, display_width, display_height, stop_event):
     """Gửi frame hiển thị sang luồng chuyển đổi và bỏ frame preview cũ."""
     if display_queue is None or display_frame is None:
@@ -682,7 +1033,7 @@ def _display_converter_worker(app, display_queue, stop_event):
         try:
             rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             if display_width > 0 and display_height > 0:
-                rgb_frame = cv2.resize(rgb_frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
+                rgb_frame = _resize_keep_aspect_rgb(rgb_frame, int(display_width), int(display_height))
             pil_image = Image.fromarray(rgb_frame)
             with app.state_lock:
                 app.latest_pil_image = pil_image
@@ -698,6 +1049,73 @@ def _select_torch_device():
         except Exception:
             pass
     return "cpu"
+
+
+def _create_deepsort_tracker(performance_cfg, device, use_half):
+    """Khởi tạo deep-sort-realtime đúng API, có fallback cho bản package cũ."""
+    if DeepSort is None:
+        raise RuntimeError("deep-sort-realtime chưa được cài hoặc import lỗi")
+    kwargs = {
+        "max_age": TRACK_MAX_AGE,
+        "n_init": TRACK_N_INIT,
+        "max_cosine_distance": TRACK_MAX_COSINE_DISTANCE,
+        "nn_budget": TRACK_NN_BUDGET,
+        # Theo deep-sort-realtime: nms_max_overlap=1.0 sẽ bỏ qua NMS nội bộ,
+        # tránh làm lại NMS vì YOLO + bước suppress duplicate đã xử lý trước.
+        "nms_max_overlap": 1.0,
+        "embedder": str(performance_cfg.get("tracker_embedder", "mobilenet")),
+        "half": bool(use_half),
+        "bgr": True,
+        "embedder_gpu": str(device).startswith("cuda"),
+    }
+    try:
+        return DeepSort(**kwargs)
+    except TypeError:
+        # Một số môi trường có deep-sort-realtime cũ hơn. Fallback để không làm app chết.
+        for key in ("embedder_gpu", "bgr", "half", "embedder", "nms_max_overlap"):
+            kwargs.pop(key, None)
+        return DeepSort(**kwargs)
+    except Exception as exc:
+        # Nếu các tham số embedder/GPU gây lỗi môi trường, thử lại cấu hình gốc
+        # của project để realtime vẫn mở được thay vì dừng hoàn toàn.
+        print(f"[DeepSort] Fallback cấu hình tối giản do lỗi khởi tạo: {exc}")
+        return DeepSort(
+            max_age=TRACK_MAX_AGE,
+            n_init=TRACK_N_INIT,
+            max_cosine_distance=TRACK_MAX_COSINE_DISTANCE,
+            nn_budget=TRACK_NN_BUDGET,
+        )
+
+
+def _create_tracker(performance_cfg, device, use_half):
+    """Khởi tạo tracker theo profile: deepsort hoặc bytetrack_lite."""
+    tracker_type = str(performance_cfg.get("tracker_type", "deepsort")).strip().lower()
+    if tracker_type in {"byte", "bytetrack", "bytetrack_lite", "byte_track"}:
+        print("[Tracker] Dùng ByteTrackLite: không chạy ReID/CNN embedding, phù hợp realtime.")
+        return ByteTrackLite(
+            max_age=int(performance_cfg.get("bytetrack_max_age", min(TRACK_MAX_AGE, 60))),
+            n_init=int(performance_cfg.get("bytetrack_n_init", 1)),
+            track_high_thresh=float(performance_cfg.get("bytetrack_high_thresh", 0.45)),
+            track_low_thresh=float(performance_cfg.get("bytetrack_low_thresh", 0.10)),
+            new_track_thresh=float(performance_cfg.get("bytetrack_new_track_thresh", 0.45)),
+            match_thresh=float(performance_cfg.get("bytetrack_match_thresh", 0.30)),
+            low_match_thresh=float(performance_cfg.get("bytetrack_low_match_thresh", 0.20)),
+            class_aware=bool(performance_cfg.get("bytetrack_class_aware", True)),
+            velocity_alpha=float(performance_cfg.get("bytetrack_velocity_alpha", 0.70)),
+            center_match_ratio=float(performance_cfg.get("bytetrack_center_match_ratio", 0.75)),
+            min_iou_for_center_match=float(performance_cfg.get("bytetrack_min_iou_for_center_match", 0.02)),
+            min_size_similarity=float(performance_cfg.get("bytetrack_min_size_similarity", 0.45)),
+        )
+
+    try:
+        print("[Tracker] Dùng DeepSORT: có ReID embedding, ổn định hơn khi che khuất nhưng nặng hơn.")
+        return _create_deepsort_tracker(performance_cfg, device, use_half)
+    except Exception as exc:
+        print(f"[Tracker] DeepSORT lỗi ({exc}); fallback sang ByteTrackLite để realtime vẫn chạy.")
+        return ByteTrackLite(
+            max_age=int(performance_cfg.get("bytetrack_max_age", min(TRACK_MAX_AGE, 60))),
+            n_init=int(performance_cfg.get("bytetrack_n_init", 1)),
+        )
 
 
 def _resize_for_processing(frame, process_width):
@@ -719,30 +1137,41 @@ def _resize_for_processing(frame, process_width):
     return cv2.resize(frame, (process_width, process_height), interpolation=cv2.INTER_AREA)
 
 
-def _predict_yolo(model, frame, *, model_imgsz, device, use_half, max_det):
+def _predict_yolo(model, frame, *, model_imgsz, device, use_half, max_det, detect_class_ids=None):
     """Chạy YOLO với cấu hình nhanh, có fallback cho phiên bản ultralytics cũ."""
     kwargs = {
         "imgsz": int(model_imgsz),
         "conf": MODEL_CONF,
         "iou": MODEL_IOU,
-        "classes": list(DETECT_CLASS_IDS),
         "verbose": False,
         "max_det": int(max_det),
     }
+    if detect_class_ids:
+        # detect_class_ids ở đây là id thật của model YOLO, không phải id nội bộ.
+        kwargs["classes"] = list(detect_class_ids)
     if device:
         kwargs["device"] = device
     if use_half:
         kwargs["half"] = True
 
     try:
+        if torch is not None:
+            with torch.inference_mode():
+                return model(frame, **kwargs)
         return model(frame, **kwargs)
     except TypeError:
         kwargs.pop("half", None)
         kwargs.pop("max_det", None)
+        if torch is not None:
+            with torch.inference_mode():
+                return model(frame, **kwargs)
         return model(frame, **kwargs)
     except Exception:
         if use_half:
             kwargs.pop("half", None)
+            if torch is not None:
+                with torch.inference_mode():
+                    return model(frame, **kwargs)
             return model(frame, **kwargs)
         raise
 
@@ -804,11 +1233,20 @@ def process_video(app, video_path, model_path):
         display_every_n = max(1, int(performance_cfg.get("display_every_n", 1)))
         detect_interval = max(1, int(performance_cfg.get("detect_interval", getattr(app, "detect_interval", 1))))
         max_det = max(1, int(performance_cfg.get("max_det", 300)))
+        detect_internal_class_ids = _resolve_detect_internal_class_ids(performance_cfg)
+        detect_class_ids = None  # id thật của model, được resolve sau khi load model.names
         track_ignored_classes = bool(performance_cfg.get("track_ignored_classes", True))
         drop_frames_when_slow = bool(performance_cfg.get("drop_frames_when_slow", False))
         display_width = max(1, int(performance_cfg.get("display_width", 880)))
         display_height = max(1, int(performance_cfg.get("display_height", 620)))
         async_display = bool(performance_cfg.get("async_display", ASYNC_DISPLAY_CONVERSION))
+        detection_conf_scale = float(performance_cfg.get("detection_conf_scale", 1.0) or 1.0)
+        track_display_max_age = int(performance_cfg.get("track_display_max_age", TRACK_DISPLAY_MAX_AGE))
+        bbox_thickness = max(1, int(performance_cfg.get("bbox_thickness", 2)))
+        bbox_center_radius = max(0, int(performance_cfg.get("bbox_center_radius", 3)))
+        draw_track_labels = bool(performance_cfg.get("draw_track_labels", False))
+        draw_detection_labels = bool(performance_cfg.get("draw_detection_labels", False))
+        profile_resolution_name = str(performance_cfg.get("profile_resolution_name", ""))
 
         if headless_mode:
             # Chế độ headless chỉ xuất CSV, không tạo ảnh preview để tránh tốn CPU/RAM.
@@ -837,21 +1275,23 @@ def process_video(app, video_path, model_path):
             use_half = False
             model.to("cpu")
 
+        model_to_internal_cls, ignored_model_classes, unknown_model_classes = _build_model_class_map(model)
+        detect_class_ids = _resolve_model_detect_class_ids(model_to_internal_cls, detect_internal_class_ids)
+
         _warmup_model(model, model_imgsz=model_imgsz, device=device, use_half=use_half, max_det=max_det)
 
-        mapping_warnings = _validate_model_class_mapping(model)
-        if mapping_warnings:
-            warning_text = "Class mapping mismatch: " + "; ".join(mapping_warnings)
-            print("[Cảnh báo model]", warning_text)
-            with app.state_lock:
-                app.worker_state["status"] = warning_text
-
-        tracker = DeepSort(
-            max_age=TRACK_MAX_AGE,
-            n_init=TRACK_N_INIT,
-            max_cosine_distance=TRACK_MAX_COSINE_DISTANCE,
-            nn_budget=TRACK_NN_BUDGET,
+        mapping_warnings = _validate_model_class_mapping(
+            model,
+            model_to_internal=model_to_internal_cls,
+            ignored=ignored_model_classes,
+            unknown=unknown_model_classes,
         )
+        if mapping_warnings:
+            warning_text = "; ".join(mapping_warnings)
+            print("[Model class map]", warning_text)
+            # Không giữ trạng thái cảnh báo quá lâu; chỉ in console để debug.
+
+        tracker = _create_tracker(performance_cfg, device, use_half)
 
         realtime_source = _is_realtime_source(video_path)
         cap = _open_capture(video_path)
@@ -862,6 +1302,7 @@ def process_video(app, video_path, model_path):
         fps_input, fps_metadata_valid = _sanitize_capture_fps(raw_fps, fallback=30.0)
         target_process_fps, fps_downsample_enabled = _resolve_target_process_fps(fps_input, performance_cfg)
         target_frame_period = 1.0 / target_process_fps if target_process_fps > 0 else 0.0
+        strict_fps_lock = bool(performance_cfg.get("strict_fps_lock", False))
 
         low_latency_queue = realtime_source or drop_frames_when_slow
         realtime_queue_size = max(1, int(performance_cfg.get("realtime_queue_size", REALTIME_QUEUE_SIZE)))
@@ -954,7 +1395,8 @@ def process_video(app, video_path, model_path):
                 f"{downsample_note} | "
                 f"perf={performance_profile}, device={device}, cpu_threads={cpu_threads}, "
                 f"async_display={async_display}, skip_stale={drop_frames_when_slow}, q={buffer_size}, "
-                f"display/{display_every_n}, imgsz={model_imgsz}, width={process_width or 'native'}"
+                f"display/{display_every_n}, imgsz={model_imgsz}, width={process_width or 'native'}, "
+                f"yolo_classes={list(detect_class_ids) if detect_class_ids else 'all'}"
             )
 
         if app.region_template and app.region_template.loaded:
@@ -1001,11 +1443,14 @@ def process_video(app, video_path, model_path):
 
         track_meta = {}
         prev_time = time.time()
+        fps_ema = None
         playback_start = time.time()
         processing_start = time.time()
         frame_id = 0                 # processed frame id, after FPS downsampling
         source_frame_id = 0          # original video/camera frame id
         last_source_time = 0.0       # original video time for export/replay
+        first_detection_reported = False
+        no_detection_notice_reported = False
 
         while not app.stop_event.is_set():
             try:
@@ -1025,6 +1470,16 @@ def process_video(app, video_path, model_path):
 
             frame_id += 1
             current_time = float(source_time)
+
+            if strict_fps_lock and (not realtime_source) and (not headless_mode):
+                # Reader đã replay file theo source_time, nhưng khi queue có sẵn
+                # frame hoặc lúc vừa khởi động vẫn có thể tạo burst ngắn. Throttle
+                # thêm ở worker để FPS hiển thị/xử lý không vượt quá mốc lock.
+                expected_process_time = playback_start + current_time
+                delay = expected_process_time - time.time()
+                if delay > 0:
+                    time.sleep(delay)
+
             last_source_time = current_time
             frame = _resize_for_processing(frame, process_width)
             should_update_display = (frame_id % display_every_n == 0)
@@ -1032,6 +1487,8 @@ def process_video(app, video_path, model_path):
 
             detections = []
             display_only_detections = []
+            raw_yolo_boxes = 0
+            mapped_yolo_boxes = 0
             if frame_id % detect_interval == 0:
                 results = _predict_yolo(
                     model,
@@ -1040,12 +1497,19 @@ def process_video(app, video_path, model_path):
                     device=device,
                     use_half=use_half,
                     max_det=max_det,
+                    detect_class_ids=detect_class_ids,
                 )
 
                 frame_h, frame_w = frame.shape[:2]
                 for result in results:
                     for box in result.boxes:
-                        cls = int(box.cls[0])
+                        raw_yolo_boxes += 1
+                        model_cls = int(box.cls[0])
+                        cls = model_to_internal_cls.get(model_cls)
+                        if cls is None:
+                            continue
+                        cls = _merge_internal_class(cls)
+                        mapped_yolo_boxes += 1
                         conf = float(box.conf[0])
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
 
@@ -1054,7 +1518,14 @@ def process_video(app, video_path, model_path):
                         x2 = max(0, min(x2, frame_w - 1))
                         y2 = max(0, min(y2, frame_h - 1))
 
-                        if not _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_w, frame_h):
+                        if not _passes_detection_filters(cls, conf, x1, y1, x2, y2, frame_w, frame_h, conf_scale=detection_conf_scale):
+                            continue
+
+                        x1, y1, x2, y2 = _expand_bbox_by_class(
+                            cls, x1, y1, x2, y2, frame_w, frame_h
+                        )
+
+                        if not _passes_perspective_size_filter(cls, x1, y1, x2, y2, frame_w, frame_h):
                             continue
 
                         w, h = x2 - x1, y2 - y1
@@ -1068,10 +1539,34 @@ def process_video(app, video_path, model_path):
                         else:
                             detections.append(([x1, y1, w, h], conf, cls))
 
+                detections = _suppress_motorbike_part_detections(detections)
                 detections = _suppress_duplicate_detections(detections)
+                if (not first_detection_reported) and (detections or display_only_detections):
+                    first_detection_reported = True
+                    print(
+                        f"[Detect] OK frame={frame_id}: raw={raw_yolo_boxes}, "
+                        f"mapped={mapped_yolo_boxes}, tracker={len(detections)}, "
+                        f"display_only={len(display_only_detections)}"
+                    )
+                elif (
+                    frame_id >= 60
+                    and not first_detection_reported
+                    and not no_detection_notice_reported
+                ):
+                    no_detection_notice_reported = True
+                    print(
+                        "[Detect] Chưa có detection sau 60 frame. "
+                        f"raw_yolo_boxes_frame={raw_yolo_boxes}, mapped_frame={mapped_yolo_boxes}, "
+                        f"model.names={getattr(model, 'names', {})}, yolo_classes="
+                        f"{list(detect_class_ids) if detect_class_ids else 'all'}"
+                    )
 
             tracks = tracker.update_tracks(detections, frame=frame)
-            primary_tracks, duplicate_track_ids = _suppress_duplicate_tracks(tracks, track_meta)
+            primary_tracks, duplicate_track_ids = _suppress_duplicate_tracks(
+                tracks,
+                track_meta,
+                display_max_age=track_display_max_age,
+            )
             for duplicate_id in duplicate_track_ids:
                 # Nếu ID trùng/ghost này đã phát IN trước khi được
                 # nhận ra là trùng, đóng lượt đó bằng OUT trước khi
@@ -1097,7 +1592,7 @@ def process_video(app, video_path, model_path):
 
             if DEBUG_TRACK_LOGS:
                 print(
-                    f"[DeepSort] Frame={frame_id} detections={len(detections)} "
+                    f"[Tracker] Frame={frame_id} detections={len(detections)} "
                     f"total_tracks={len(tracks)} primary_tracks={len(primary_tracks)} "
                     f"suppressed={len(duplicate_track_ids)}"
                 )
@@ -1165,9 +1660,10 @@ def process_video(app, video_path, model_path):
                 for det_box, det_conf, det_cls in display_only_detections:
                     x, y, w, h = [int(v) for v in det_box]
                     color = CLASS_COLORS.get(int(det_cls), (180, 180, 180))
-                    label = f"{CLASS_NAMES.get(int(det_cls), det_cls)} {float(det_conf):.2f}"
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, 1)
-                    cv2.putText(display_frame, label, (x, max(12, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), color, bbox_thickness)
+                    if draw_detection_labels:
+                        label = f"{_class_display_name(det_cls)} {float(det_conf):.2f}"
+                        cv2.putText(display_frame, label, (x, max(12, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, max(1, bbox_thickness))
 
             for track in primary_tracks:
                 track_id = track.track_id
@@ -1181,17 +1677,22 @@ def process_video(app, video_path, model_path):
                     continue
 
                 active_tracks += 1
-                centroid = centroid_from_box((l, t, r, b))
+                # Dùng điểm giữa cạnh dưới bbox để xác định vùng trên mặt đường.
+                # Tâm bbox vẫn hữu ích để vẽ box, nhưng dễ lệch vùng khi camera nhìn chéo.
+                region_point = region_point_from_box(
+                    (l, t, r, b),
+                    use_bottom_center=USE_BOTTOM_CENTER_FOR_REGION,
+                )
                 meta = track_meta.setdefault(track_id, create_track_meta(frame_id, int(det_cls)))
-                previous_centroid = meta.get("last_centroid")
+                previous_region_point = meta.get("last_region_point")
                 previous_region = meta.get("current_region") or meta.get("stable_region")
                 raw_region = get_direction_region(
-                    centroid,
+                    region_point,
                     frame.shape[1],
                     frame.shape[0],
                     app.region_margin,
                     app.region_template,
-                    previous_centroid=previous_centroid,
+                    previous_centroid=previous_region_point,
                     current_region=previous_region,
                 )
 
@@ -1202,7 +1703,8 @@ def process_video(app, video_path, model_path):
 
                 stable_region = update_stable_region(meta, raw_region)
                 meta["current_region"] = stable_region
-                meta["last_centroid"] = centroid
+                meta["last_region_point"] = region_point
+                meta["last_centroid"] = region_point
 
                 if exporter is not None:
                     exporter.log_track_sample(
@@ -1226,7 +1728,7 @@ def process_video(app, video_path, model_path):
                             if (
                                 bool(app.infer_hidden_left_var.get())
                                 and stable_region == "center"
-                                and _near_hidden_left_gate(centroid, frame.shape[1], app)
+                                and _near_hidden_left_gate(region_point, frame.shape[1], app)
                                 and not meta.get("fluid_started_from_left", False)
                             ):
                                 _export_track_transition(
@@ -1239,30 +1741,44 @@ def process_video(app, video_path, model_path):
                                     to_region="center",
                                     cls=cls,
                                     box=(l, t, r, b),
-                                    centroid=centroid,
+                                    centroid=region_point,
                                     source="inferred",
                                     confidence=0.70,
                                     reason="first_seen_center_near_left_gate",
                                 )
                                 meta["fluid_started_from_left"] = True
                             meta["last_fluid_region"] = stable_region
+                            meta["last_fluid_region_time"] = current_time
                         elif previous_fluid_region != stable_region:
-                            _export_track_transition(
-                                exporter,
-                                meta=meta,
-                                track_id=track_id,
-                                frame_id=frame_id,
-                                current_time=current_time,
-                                from_region=previous_fluid_region,
-                                to_region=stable_region,
-                                cls=cls,
-                                box=(l, t, r, b),
-                                centroid=centroid,
-                                source="observed",
-                                confidence=1.0,
-                                reason="stable_region_change",
+                            # Chỉ xuất transition đã qua FSM 8 làn. Transition ngược
+                            # như center->inbound/outbound->center hoặc nhấp nháy quá
+                            # nhanh sẽ bị loại khỏi CSV flow/OD.
+                            transitions = resolve_validated_fluid_transitions(
+                                meta,
+                                previous_fluid_region,
+                                stable_region,
+                                frame_id,
+                                current_time,
                             )
-                            meta["last_fluid_region"] = stable_region
+                            for transition in transitions:
+                                _export_track_transition(
+                                    exporter,
+                                    meta=meta,
+                                    track_id=track_id,
+                                    frame_id=frame_id,
+                                    current_time=transition.get("time_s", current_time),
+                                    from_region=transition["from_region"],
+                                    to_region=transition["to_region"],
+                                    cls=cls,
+                                    box=(l, t, r, b),
+                                    centroid=region_point,
+                                    source=transition.get("source", "observed"),
+                                    confidence=transition.get("confidence", 1.0),
+                                    reason=transition.get("reason", "validated_region_change"),
+                                )
+                            if transitions:
+                                meta["last_fluid_region"] = stable_region
+                                meta["last_fluid_region_time"] = current_time
 
                 if stable_region is not None:
                     current_is_branch = stable_region in valid_branches and _is_counted_cls(cls)
@@ -1306,20 +1822,21 @@ def process_video(app, video_path, model_path):
                 if should_update_display and display_frame is not None:
                     color = CLASS_COLORS.get(cls, (255, 255, 255))
 
-                    label = f"{CLASS_NAMES.get(cls, cls)} #{track_id}"
-                    region_label = stable_region if stable_region is not None else raw_region
-                    if region_label:
-                        label += f" {region_label}"
-
-                    cv2.rectangle(display_frame, (l, t), (r, b), color, 2)
-                    cv2.putText(display_frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                    cv2.circle(display_frame, centroid, 3, color, -1)
+                    cv2.rectangle(display_frame, (l, t), (r, b), color, bbox_thickness)
+                    if draw_track_labels:
+                        label = f"{_class_display_name(cls)} #{track_id}"
+                        region_label = stable_region if stable_region is not None else raw_region
+                        if region_label:
+                            label += f" {region_label}"
+                        cv2.putText(display_frame, label, (l, t - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, max(1, bbox_thickness))
+                    if bbox_center_radius > 0:
+                        cv2.circle(display_frame, region_point, bbox_center_radius, color, -1)
 
                 if DEBUG_TRACK_LOGS:
                     print(
-                        f"[DeepSort]   Track={track_id} stable_cls={cls} raw_cls={det_cls} "
-                        f"conf={det_conf} label={CLASS_NAMES.get(cls, cls)} "
-                        f"ltrb=({l},{t},{r},{b}) centroid={centroid} raw={raw_region} "
+                        f"[Tracker]   Track={track_id} stable_cls={cls} raw_cls={det_cls} "
+                        f"conf={det_conf} label={_class_display_name(cls)} "
+                        f"ltrb=({l},{t},{r},{b}) region_point={region_point} raw={raw_region} "
                         f"stable={stable_region} active_branch={meta.get('active_branch')} "
                         f"confirmed={track.is_confirmed()} time_since_update={track.time_since_update}"
                     )
@@ -1352,16 +1869,28 @@ def process_video(app, video_path, model_path):
 
             curr_time = time.time()
             fps = 1.0 / (curr_time - prev_time) if curr_time > prev_time else 0.0
+            fps_ema = fps if fps_ema is None else (0.85 * fps_ema + 0.15 * fps)
             prev_time = curr_time
 
             pil_image = None
             if should_update_display and display_frame is not None:
+                target_display_width, target_display_height = _get_display_target_size(app, display_width, display_height)
                 if async_display:
-                    _put_display_frame(display_queue, display_frame, display_width, display_height, app.stop_event)
+                    _put_display_frame(
+                        display_queue,
+                        display_frame,
+                        target_display_width,
+                        target_display_height,
+                        app.stop_event,
+                    )
                 else:
                     rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    if display_width > 0 and display_height > 0:
-                        rgb_frame = cv2.resize(rgb_frame, (display_width, display_height), interpolation=cv2.INTER_AREA)
+                    if target_display_width > 0 and target_display_height > 0:
+                        rgb_frame = _resize_keep_aspect_rgb(
+                            rgb_frame,
+                            target_display_width,
+                            target_display_height,
+                        )
                     pil_image = Image.fromarray(rgb_frame)
 
             total_current_pce = 0.0
@@ -1407,15 +1936,17 @@ def process_video(app, video_path, model_path):
                     # cùng một xe lần nữa sau khi đi qua center.
                     total_in_count += branch_count_total[(branch, "in")]
 
-            realtime_ratio = fps / target_process_fps if target_process_fps > 0 else 0.0
+            display_fps = fps_ema if fps_ema is not None else fps
+            realtime_ratio = display_fps / target_process_fps if target_process_fps > 0 else 0.0
             source_label = "trực tiếp" if realtime_source else "file"
             downsample_label = f", src_fps={fps_input:.1f}->proc_fps={target_process_fps:.1f}"
             display_label = "headless" if headless_mode else f"hiển_thị/{display_every_n}"
             status_text = (
-                f"Đang chạy ({source_label}, {performance_profile}, {device}, "
+                f"Đang chạy ({source_label}, {performance_profile}/{profile_resolution_name or (str(process_width) + 'px')}, {device}, "
                 f"{realtime_ratio:.2f}x tốc_độ_xử_lý{downsample_label}, detect/{detect_interval}, "
                 f"{display_label}, max_det={max_det}, "
-                f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
+                f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, "
+                f"lock_fps={'bật' if strict_fps_lock else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
             )
 
             with app.state_lock:
@@ -1423,7 +1954,7 @@ def process_video(app, video_path, model_path):
                     app.latest_pil_image = pil_image
                 app.worker_state["status"] = status_text
                 app.worker_state["frame"] = f"{frame_id}/{source_frame_id}"
-                app.worker_state["fps"] = f"{fps:.1f}"
+                app.worker_state["fps"] = f"{display_fps:.1f}"
                 app.worker_state["active_tracks"] = str(active_tracks)
                 app.worker_state["current_pce"] = f"{total_current_pce:.1f}"
                 app.worker_state["flow_veh_pm"] = str(total_in_count)
@@ -1436,7 +1967,7 @@ def process_video(app, video_path, model_path):
                     last_headless_progress_print = now_print
                     print(
                         f"[HEADLESS] video_t={current_time:9.1f}s "
-                        f"frame={frame_id}/{source_frame_id} fps={fps:5.1f} "
+                        f"frame={frame_id}/{source_frame_id} fps={display_fps:5.1f} "
                         f"tracks={active_tracks:3d} pce={total_current_pce:5.1f} "
                         f"total_in={total_in_count} export={getattr(app, 'export_output_dir', '') or '-'}"
                     )
