@@ -1,35 +1,62 @@
 """Các hằng số dùng chung cho ứng dụng phân tích lưu lượng phương tiện."""
 
-# Mapping class cho file data.yaml traffic_count_vn hiện tại:
-#   0=bicycle, 1=bus, 2=car, 3=motorbike, 4=person.
+# Mapping class cho file data.yaml sau khi đã bỏ license plate:
+#   0=bus, 1=car, 2=motorbike, 3=pedestrian, 4=truck.
 #
-# ``person`` vẫn được giữ trong detection/tracking/hiển thị để UI có thể
-# hiển thị phục vụ kiểm tra, nhưng bị loại khỏi COUNTED_CLASS_IDS và không có trọng số PCE.
-# Vì vậy người vẫn được detect/vẽ box, nhưng không bao giờ đóng góp Vao
-# PCE/count/flow/route/file xuất cho RL.
+# Trong pipeline realtime, truck được gộp về class 0 để tăng ổn định tracker
+# cho nhóm xe lớn. Model YOLO vẫn có thể trả truck=4, nhưng sau YOLO và trước
+# tracker/count, class 4 sẽ được đổi thành class 0. Vì vậy class 0 được hiển thị
+# là Xe buýt và dùng chung trọng số PCE cho xe lớn.
+#
+# ``pedestrian`` vẫn được giữ trong detection/hiển thị để UI có thể kiểm tra,
+# nhưng bị loại khỏi COUNTED_CLASS_IDS và không có trọng số PCE.
 CLASS_NAMES = {
-    0: "bicycle",
-    1: "bus",
-    2: "car",
-    3: "motorbike",
-    4: "person",
+    0: "bus",
+    1: "car",
+    2: "motorbike",
+    3: "pedestrian",
+    4: "truck",  # class gốc của model, sẽ merge về 0 trước tracker/count
+}
+
+# Gộp class sau YOLO, trước filter/tracker/count.
+# 4=truck -> 0=bus để tránh cùng một xe lớn lúc là bus, lúc là truck.
+CLASS_MERGE_MAP = {
+    4: 0,
+}
+
+# Tên hiển thị cho UI/log. Class 4 truck được merge về 0 nên nhóm xe lớn
+# vẫn hiển thị là "Xe buýt" theo yêu cầu giao diện.
+CLASS_DISPLAY_NAMES = {
+    0: "Xe buýt",
+    1: "Ô tô",
+    2: "Xe máy",
+    3: "Người đi bộ",
+    4: "Xe tải",
+}
+
+CLASS_DISPLAY_NAME_OVERRIDE = {
+    0: "Xe buýt",
 }
 
 CLASS_WEIGHTS = {
-    0: 0.2,   # bicycle
-    1: 2.0,   # bus
-    2: 1.0,   # car
-    3: 0.3,   # motorbike
-    # 4=person được cố ý loại khỏi phần đếm flow.
+    0: 2.0,   # bus/heavy vehicle, truck đã merge về bus
+    1: 1.0,   # car
+    2: 0.3,   # motorbike
+    # 3=pedestrian được cố ý loại khỏi phần đếm flow.
+    # 4=truck đã được merge về 0 trước khi count/PCE.
 }
 
-# Các class gửi Vao YOLO/DeepSORT. Giữ person ở đây để vẫn detect và
+# Các class gửi vào YOLO/DeepSORT. Giữ pedestrian ở đây để vẫn detect và
 # hiển thị được trên video overlay.
 DETECT_CLASS_IDS = tuple(CLASS_NAMES.keys())
 
-# Các class được tính Vao count/flow/PCE/file cho RL.
+# Các class được tính vào count/flow/PCE/file cho RL.
 COUNTED_CLASS_IDS = tuple(CLASS_WEIGHTS.keys())
 IGNORED_CLASS_IDS = tuple(sorted(set(DETECT_CLASS_IDS) - set(COUNTED_CLASS_IDS)))
+# Profile realtime vẫn detect đủ class, bao gồm pedestrian. Pedestrian được track
+# bằng ByteTrack để hiển thị ID/bbox nhưng không thuộc COUNTED_CLASS_IDS nên
+# không tham gia PCE/count/flow.
+REALTIME_DETECT_CLASS_IDS = DETECT_CLASS_IDS
 EXPECTED_MODEL_NAMES = CLASS_NAMES.copy()
 
 # Bố cục vùng/làn. Mỗi nhánh đường được chia thành hai vùng làn:
@@ -42,7 +69,8 @@ LANE_REGION_ORDER = ("t1", "t2", "l1", "l2", "r1", "r2", "b1", "b2")
 BRANCH_ORDER = LANE_REGION_ORDER + ("center",)
 VALID_BRANCHES = set(BRANCH_ORDER)
 DIRECTIONS = ("in", "out")
-DISPLAY_CLASS_IDS = (2, 3)  # car, motorbike
+DISPLAY_CLASS_IDS = (0, 1, 2)  # Xe buýt, Ô tô, Xe máy
+COLOR_LEGEND_CLASS_IDS = (0, 1, 2, 3)  # thêm Người đi bộ vào chú thích màu, không đưa vào bảng đếm
 
 REGION_DISPLAY_NAMES = {
     "t1": "T1 Vao",
@@ -111,11 +139,11 @@ REGION_NAME_MAP = {
 # Đường dẫn template mặc định hiển thị trên UI. Template 4 vùng cũ vẫn sẽ
 # bị RegionTemplate từ chối, nên giữ mặc định này vẫn an toàn cho app 8 làn.
 DEFAULT_TEMPLATE_MAPPING = "template.csv"
-DEFAULT_MODEL_PATH = "models/tuning_50.pt"
+DEFAULT_MODEL_PATH = "models/best.pt"
 DEFAULT_AVAILABLE_MODELS = [
     "models/tuning_200.pt",
     "models/tuning_50.pt",
-    # "models/tuning.pt",
+    "models/best.pt",
     # "models/yolov8n.pt",
     # "models/yolov8s.pt",
     # "models/yolov8m.pt",
@@ -129,6 +157,21 @@ DEFAULT_AVAILABLE_MODELS = [
 STABLE_REGION_FRAMES = 5
 REGION_HISTORY_LEN = 12
 EVENT_COOLDOWN_FRAMES = 12
+
+# Hậu xử lý region/transition cho dữ liệu flow.
+# Dùng điểm giữa cạnh dưới bbox để xác định vùng xe đang đứng trên mặt đường,
+# thay vì dùng tâm bbox. Cách này giảm sai lệch khi camera nhìn chéo.
+USE_BOTTOM_CENTER_FOR_REGION = True
+
+# Cooldown riêng cho transition xuất ra file fluid replay/OD. Giữ nhỏ để không
+# làm mất cạnh center->outbound ở xe chạy nhanh; hướng ngược vẫn bị FSM loại.
+FLUID_TRANSITION_COOLDOWN_FRAMES = 3
+
+# Nếu một track nhảy trực tiếp từ làn vào sang làn ra mà thiếu center, có thể
+# suy luận center bị bỏ lỡ giữa hai frame và tách thành lane->center->lane.
+# Tắt nếu muốn chỉ giữ cạnh quan sát tuyệt đối.
+FLUID_INFER_MISSING_CENTER = True
+FLUID_INFERRED_CENTER_CONFIDENCE = 0.80
 
 # Giữ branch đang hoạt động thêm một thời gian ngắn khi bị che khuất trước khi phát OUT.
 # Điều này tránh việc mất detection một frame làm thay đổi count/trạng thái branch ngay lập tức.
@@ -145,17 +188,17 @@ FRAME_EXIT_MARGIN_RATIO = 0.025
 # bằng CLASS_CONF_THRESHOLDS bên dưới. Cách này linh hoạt hơn một ngưỡng chung.
 MODEL_IMGSZ = 1280
 MODEL_CONF = 0.10
-MODEL_IOU = 0.50
+MODEL_IOU = 0.60
 
 # Ngưỡng confidence riêng theo từng class.
-# Tăng ngưỡng car nếu xe máy/xe đạp thường bị đoán nhầm thành car.
-# Giảm ngưỡng motorbike/bicycle nếu xe nhỏ bị bỏ sót nhiều.
+# Tăng ngưỡng car/truck nếu xe máy thường bị đoán nhầm thành xe lớn.
+# Giảm ngưỡng motorbike nếu xe nhỏ bị bỏ sót nhiều.
 CLASS_CONF_THRESHOLDS = {
-    0: 0.22,  # bicycle
-    1: 0.8,  # bus
-    2: 0.5,  # car
-    3: 0.22,  # motorbike
-    4: 0.30,  # person, chỉ detect/hiển thị
+    0: 0.75,  # bus
+    1: 0.86,  # car
+    2: 0.36,  # motorbike
+    3: 0.2,  # pedestrian, chỉ detect/hiển thị
+    4: 0.8,  # truck
 }
 
 # Bộ lọc hình học cơ bản để loại box nhiễu/không hợp lý.
@@ -163,32 +206,79 @@ CLASS_CONF_THRESHOLDS = {
 # làm hình dạng vật thể thay đổi theo hướng nhìn.
 MIN_BOX_AREA_RATIO = 0.00008
 MIN_BOX_WH = {
-    0: (8, 8),    # bicycle
-    1: (20, 20),  # bus
-    2: (16, 16),  # car
-    3: (8, 8),    # motorbike
-    4: (8, 14),   # person, chỉ detect/hiển thị
+    0: (20, 20),  # bus
+    1: (16, 16),  # car
+    2: (8, 8),    # motorbike
+    3: (10, 22),  # pedestrian, chỉ detect/hiển thị
+    4: (20, 20),  # truck
 }
+
+# Các ngưỡng pixel như MIN_BOX_WH được khai báo theo mốc tham chiếu này.
+# Khi đổi profile sang 736/960/1280, video_worker sẽ tự scale ngưỡng theo
+# frame_width / FILTER_REFERENCE_WIDTH. Nhờ vậy filter không bị quá lỏng khi
+# tăng phân giải và không quá gắt khi giảm phân giải realtime.
+FILTER_REFERENCE_WIDTH = 960
 CLASS_ASPECT_RATIO_LIMITS = {
-    0: (0.18, 5.50),  # bicycle
-    1: (0.30, 7.00),  # bus
-    2: (0.30, 5.50),  # car
-    3: (0.18, 5.50),  # motorbike
-    4: (0.15, 2.80),  # person, chỉ detect/hiển thị
+    0: (0.30, 7.00),  # bus/heavy vehicle
+    1: (0.30, 5.50),  # car
+    2: (0.18, 5.50),  # motorbike
+    3: (0.18, 1.80),  # pedestrian, chỉ detect/hiển thị
+    4: (0.30, 7.00),  # truck gốc, thường đã merge về 0
 }
+
+# Lọc kích thước bbox theo phối cảnh camera cố định.
+# Đây không phải distance/depth thật, mà là ước lượng theo vị trí đáy bbox:
+# - y2/frame_height nhỏ: vật thể xa camera, cho phép bbox nhỏ hơn.
+# - y2/frame_height lớn: vật thể gần camera, yêu cầu bbox lớn hơn để loại nhiễu.
+PERSPECTIVE_SIZE_FILTER_ENABLED = True
+
+# class_id: (far_min_area_ratio, near_min_area_ratio)
+# area_ratio = bbox_area / frame_area.
+# Vì truck đã merge về 0, nhóm xe lớn dùng rule của class 0.
+PERSPECTIVE_MIN_AREA_RATIO = {
+    0: (0.00045, 0.00350),  # bus/heavy vehicle
+    1: (0.00030, 0.00220),  # car
+    2: (0.00018, 0.00120),  # motorbike
+    3: (0.00018, 0.00110),  # pedestrian, nếu còn hiển thị
+}
+
+# >1 nghĩa là vùng gần camera bị siết mạnh hơn, vùng xa vẫn thoáng.
+PERSPECTIVE_AREA_GAMMA = 1.35
+
+# Scale riêng cho phần xa/gần trong perspective filter.
+# near-only giúp tăng lọc nhiễu ở gần camera mà không làm mất xe máy nhỏ ở xa.
+PERSPECTIVE_FAR_MIN_AREA_SCALE = 1.0
+PERSPECTIVE_NEAR_MIN_AREA_SCALE = 1.0
+
+# Mở rộng bbox theo class sau YOLO và trước tracker.
+# Dùng cho trường hợp YOLO chỉ bắt phần thân xe máy, còn kính/ghi-đông phía trên
+# bị detect thành một motorbike nhỏ khác. Tuple là (left, top, right, bottom)
+# theo tỉ lệ của bbox gốc.
+CLASS_BBOX_EXPAND_RATIO = {
+    2: (0.08, 0.35, 0.08, 0.08),  # motorbike: mở rộng nhiều lên phía trên
+}
+
+# Sau khi mở rộng bbox motorbike, xóa các box motorbike nhỏ nằm phần lớn
+# trong một box motorbike lớn hơn. Mục tiêu là bỏ box phụ ở kính/ghi-đông
+# nhưng vẫn hạn chế xóa nhầm xe thật đứng cạnh nhau.
+MOTORBIKE_PART_SUPPRESSION_ENABLED = True
+MOTORBIKE_PART_CLASS_ID = 2
+MOTORBIKE_PART_MAX_AREA_RATIO = 0.55   # box nhỏ < 55% diện tích box lớn mới bị xét là part
+MOTORBIKE_PART_MIN_IOA = 0.70          # phần giao / diện tích box nhỏ
+
 
 # Khử detection trùng trước DeepSORT. Xử lý trường hợp thường gặp
 # khi YOLO trả nhiều box cho cùng một xe máy/ô tô, sau đó
 # bị DeepSORT tách thành nhiều ID.
-DETECTION_DUPLICATE_IOU = 0.35
-DETECTION_DUPLICATE_CONTAINMENT = 0.72
-DETECTION_DUPLICATE_CENTER_RATIO = 0.32
+DETECTION_DUPLICATE_IOU = 0.45
+DETECTION_DUPLICATE_CONTAINMENT = 0.82
+DETECTION_DUPLICATE_CENTER_RATIO = 0.30
 
 # Khử track DeepSORT trùng sau khi update. Tránh các ghost ID cũ
 # bị vẽ/đếm cùng ID mới của cùng một phương tiện.
-TRACK_DUPLICATE_IOU = 0.30
-TRACK_DUPLICATE_CONTAINMENT = 0.68
-TRACK_DUPLICATE_CENTER_RATIO = 0.35
+TRACK_DUPLICATE_IOU = 0.42
+TRACK_DUPLICATE_CONTAINMENT = 0.78
+TRACK_DUPLICATE_CENTER_RATIO = 0.32
 TRACK_STALE_MERGE_FRAMES = 180
 
 # Độ ổn định tracking DeepSORT. max_age nội bộ được để cao để tracker giữ
@@ -198,6 +288,10 @@ TRACK_N_INIT = 4
 TRACK_MAX_COSINE_DISTANCE = 0.22
 TRACK_NN_BUDGET = 200
 TRACK_DISPLAY_MAX_AGE = 4
+# Riêng realtime/ByteTrack nên chỉ vẽ track vừa match detection.
+# Nếu vẽ track mất match 3-4 frame, xe chạy nhanh sẽ xuất hiện 1 bbox thật quanh xe
+# và 1 bbox ghost bị kéo phía sau.
+REALTIME_TRACK_DISPLAY_MAX_AGE = 0
 TRACK_COUNT_HOLD_FRAMES = 18
 
 
@@ -209,6 +303,11 @@ TRACK_COUNT_HOLD_FRAMES = 18
 ENABLE_SOURCE_FPS_DOWNSAMPLE = True
 TARGET_PROCESS_FPS = 15.0
 
+# Khóa FPS realtime theo nguồn: nếu video < 30 FPS thì giữ đúng FPS video,
+# nếu video > 30 FPS thì lấy mẫu/hiển thị tối đa 30 FPS.
+# Giá trị này chỉ có hiệu lực với profile bật lock_to_source_fps.
+REALTIME_FPS_LOCK_MAX = 30.0
+
 # Hỗ trợ nguồn thời gian thực. Có thể nhập 0/1 cho webcam hoặc URL RTSP/HTTP.
 REALTIME_SOURCE_PREFIXES = ("rtsp://", "rtmp://", "http://", "https://")
 REALTIME_QUEUE_SIZE = 2
@@ -218,7 +317,7 @@ FILE_QUEUE_SECONDS = 10
 DEBUG_TRACK_LOGS = False
 
 # Làm mượt class theo track. Một class phải được quan sát lặp lại trước khi
-# trở thành ổn định. Person có thể ổn định để hiển thị, nhưng class không đếm
+# trở thành ổn định. Pedestrian có thể ổn định để hiển thị, nhưng class không đếm
 # vẫn có PCE bằng 0 và bị chặn khỏi mọi count/flow export.
 CLASS_HISTORY_LEN = 28
 MIN_CLASS_VOTES = 6
@@ -228,11 +327,11 @@ CLASS_SWITCH_MIN_VOTES = 10
 CLASS_SWITCH_RATIO = 0.80
 
 CLASS_COLORS = {
-    0: (0, 200, 80),      # bicycle
-    1: (0, 190, 255),     # bus
-    2: (0, 0, 255),       # car
-    3: (255, 80, 0),      # motorbike
-    4: (160, 160, 160),   # person, bỏ qua trong flow
+    0: (0, 190, 255),     # bus
+    1: (0, 0, 255),       # car
+    2: (255, 80, 0),      # motorbike
+    3: (255, 0, 255),     # pedestrian, màu tím/hồng để không trùng màu đường/vùng
+    4: (255, 180, 0),     # truck
 }
 
 # Các preset hiệu năng.
@@ -243,54 +342,162 @@ CLASS_COLORS = {
 DEFAULT_PERFORMANCE_PROFILE = "realtime"
 PERFORMANCE_PROFILES = {
     "quality": {
-        # Chế độ offline/kiểm chứng: giữ nhiều chi tiết ảnh hơn và không bỏ frame
-        # đã lấy mẫu. Dùng khi độ chính xác export quan trọng hơn cảm giác realtime.
+        # 1280p xử lý: dùng để kiểm chứng/offline/export khi ưu tiên độ chính xác.
+        # Filter pixel sẽ tự scale theo FILTER_REFERENCE_WIDTH nên không bị lỏng
+        # khi tăng phân giải từ 960 lên 1280.
+        "profile_resolution_name": "1280p quality",
         "model_imgsz": 1280,
-        "process_width": 0,        # 0 = giữ kích thước frame gốc
+        "process_width": 1280,
         "detect_interval": 1,
         "display_every_n": 1,
         "half_cuda": True,
         "max_det": 300,
-        "track_ignored_classes": True,   # person cũng có ID DeepSORT
-        "display_width": 880,
-        "display_height": 620,
+        "track_ignored_classes": True,
+        "tracker_type": "deepsort",
+        "detection_conf_scale": 1.00,
+        # Quality giữ filter nền cho mọi class.
+        # Phần siết thêm chỉ áp dụng cho motorbike để giảm false detection xe máy
+        # ở 1280p mà không làm mất car/bus/pedestrian thật.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        "filter_min_box_wh_scale_by_class": {2: 1.},
+        "filter_min_box_area_scale_by_class": {2: 1.55},
+        # Chỉ siết mạnh motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
+        "display_width": 960,
+        "display_height": 680,
         "target_process_fps": TARGET_PROCESS_FPS,
         "drop_frames_when_slow": False,
         "realtime_queue_size": 3,
+        "bbox_thickness": 3,
+        "bbox_center_radius": 3,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.45,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.15,
+        "bbox_smooth_size_alpha": 0.45,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
+        "draw_detection_labels": False,
+        "region_label_scale": 1.00,
     },
     "balanced": {
-        # Chế độ realtime mượt. Thay vì cố xử lý 30 frame nặng mỗi
-        # giây rồi phải bỏ frame theo cụm, chế độ này lấy mẫu nguồn xuống 20 FPS và
-        # hiển thị mọi frame đã xử lý. Kết quả thường ít giật hơn.
-        "model_imgsz": 736,
+        # 960p xử lý: mốc cân bằng để kiểm tra kết quả và vẫn giữ tốc độ khá tốt.
+        "profile_resolution_name": "960p balanced",
+        "model_imgsz": 960,
         "process_width": 960,
         "detect_interval": 1,
         "display_every_n": 1,
         "half_cuda": True,
-        "max_det": 160,
-        "track_ignored_classes": False,  # detect/hiển thị person, nhưng không gửi person Vao DeepSORT
-        "display_width": 820,
-        "display_height": 580,
-        "target_process_fps": 20.0,
+        "max_det": 200,
+        "track_ignored_classes": True,
+        "tracker_type": "bytetrack_lite",
+        "bytetrack_high_thresh": 0.45,
+        "bytetrack_low_thresh": 0.10,
+        "bytetrack_new_track_thresh": 0.50,
+        "bytetrack_match_thresh": 0.18,
+        "bytetrack_low_match_thresh": 0.10,
+        "bytetrack_max_age": 30,
+        "bytetrack_n_init": 1,
+        "bytetrack_class_aware": True,
+        "bytetrack_velocity_alpha": 0.85,
+        "bytetrack_center_match_ratio": 0.85,
+        "bytetrack_min_iou_for_center_match": 0.01,
+        "bytetrack_min_size_similarity": 0.40,
+        "track_display_max_age": 1,
+        "detection_conf_scale": 1.00,
+        # Balanced giữ filter nền cho mọi class.
+        # Phần siết thêm chỉ áp dụng cho motorbike; các class khác dùng scale 1.0.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        "filter_min_box_wh_scale_by_class": {2: 1.15},
+        "filter_min_box_area_scale_by_class": {2: 1.25},
+        # Chỉ siết motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
+        "display_width": 900,
+        "display_height": 640,
+        "target_process_fps": 25.0,
         "drop_frames_when_slow": True,
         "realtime_queue_size": 2,
+        "bbox_thickness": 2,
+        "bbox_center_radius": 3,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.38,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.20,
+        "bbox_smooth_size_alpha": 0.60,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
+        "draw_detection_labels": False,
+        "region_label_scale": 0.85,
     },
     "realtime": {
-        # Chế độ realtime độ trễ thấp cho cảnh đông. FPS thấp là chủ ý:
-        # hiển thị ổn định 15 FPS dễ quan sát hơn pipeline 30 FPS nhưng
-        # liên tục bỏ frame và nhảy thời gian.
-        "model_imgsz": 640,
-        "process_width": 832,
+        # 736p xử lý: mốc realtime cho RTX 3050 Laptop + i7 gen 11.
+        # Giảm process_width nên bbox cũng mảnh hơn để tránh che hình.
+        "profile_resolution_name": "736p realtime",
+        "model_imgsz": 736,
+        "process_width": 736,
         "detect_interval": 1,
-        "display_every_n": 2,
+        "display_every_n": 1,
         "half_cuda": True,
-        "max_det": 130,
-        "track_ignored_classes": False,
-        "display_width": 780,
-        "display_height": 552,
-        "target_process_fps": 15.0,
+        "max_det": 160,
+        "track_ignored_classes": True,
+        "detect_class_ids": REALTIME_DETECT_CLASS_IDS,
+        "tracker_type": "bytetrack_lite",
+        "bytetrack_high_thresh": 0.45,
+        "bytetrack_low_thresh": 0.10,
+        "bytetrack_new_track_thresh": 0.50,
+        "bytetrack_match_thresh": 0.18,
+        "bytetrack_low_match_thresh": 0.10,
+        "bytetrack_max_age": 30,
+        "bytetrack_n_init": 1,
+        "bytetrack_class_aware": True,
+        "bytetrack_velocity_alpha": 0.85,
+        "bytetrack_center_match_ratio": 0.85,
+        "bytetrack_min_iou_for_center_match": 0.01,
+        "bytetrack_min_size_similarity": 0.40,
+        "track_display_max_age": 1,
+        "detection_conf_scale": 1.00,
+        # Realtime đang ổn nên giữ filter scale = 1.0 để không làm mất xe xa.
+        "filter_min_box_wh_scale": 1.00,
+        "filter_min_box_area_scale": 1.00,
+        "perspective_min_area_scale": 1.00,
+        # Realtime chỉ tăng rất nhẹ filter motorbike ở gần để tránh nhiễu đáy ảnh.
+        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_near_min_area_scale_by_class": {2: 1.25},
+        "tracker_embedder": "mobilenet",
+        "display_width": 900,
+        "display_height": 620,
+        # Khóa realtime theo min(video_fps, 30). Nếu video 24/25 FPS thì chạy đúng
+        # 24/25; nếu video 50/60 FPS thì chỉ lấy mẫu và phát tối đa 30 FPS.
+        "target_process_fps": REALTIME_FPS_LOCK_MAX,
+        "lock_to_source_fps": True,
+        "fps_lock_max": REALTIME_FPS_LOCK_MAX,
+        "strict_fps_lock": True,
         "drop_frames_when_slow": True,
         "realtime_queue_size": 1,
+        "cpu_thread_count": 6,
+        "bbox_thickness": 2,
+        "bbox_center_radius": 2,
+        "draw_track_labels": True,
+        "draw_track_class_name": False,
+        "track_label_font_scale": 0.32,
+        "track_label_thickness": 1,
+        "bbox_smoothing_enabled": True,
+        "bbox_smooth_center_alpha": 0.25,
+        "bbox_smooth_size_alpha": 0.70,
+        "bbox_smooth_reset_iou": 0.08,
+        "bbox_smooth_reset_center_ratio": 1.40,
+        "draw_detection_labels": False,
+        "region_label_scale": 0.65,
     },
 }
 
@@ -303,7 +510,7 @@ TORCH_INTEROP_THREADS = 2
 # Override OpenCV để tương thích ngược. Nếu >0, ưu tiên hơn CPU_THREAD_COUNT cho riêng OpenCV.
 CV2_NUM_THREADS = 0
 
-# Chuyển frame OpenCV sang đầu Vao PIL/ImageTk trong một luồng worker riêng.
+# Chuyển frame OpenCV sang đầu vào PIL/ImageTk trong một luồng worker riêng.
 # Tách BGR->RGB + resize + tạo PIL khỏi vòng lặp detection/tracking.
 ASYNC_DISPLAY_CONVERSION = True
 DISPLAY_CONVERSION_QUEUE_SIZE = 1
@@ -314,7 +521,7 @@ YOLO_WARMUP = True
 
 # Cấu hình xuất/replay flow dạng chất lỏng.
 # ROAD_BRANCHES là các vùng làn nối với nút center.
-# Làn Vao thường tạo cạnh lane->center; làn ra thường
+# Làn vào thường tạo cạnh lane->center; làn ra thường
 # tạo cạnh center->lane. Giữ đủ 8 làn ở đây để bảo toàn dữ liệu thật
 # và vẫn cho phép export các vùng chồng lấn do chuyển/lấn làn.
 ROAD_BRANCHES = LANE_REGION_ORDER

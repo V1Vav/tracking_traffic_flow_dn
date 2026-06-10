@@ -188,10 +188,17 @@ class RegionTemplate:
         if x < 0 or y < 0 or x >= width or y >= height:
             return []
 
-        # Center được kiểm tra trước vì đây là nút giao về mặt ngữ nghĩa.
-        region_order = ["center"] if "center" in self.regions else []
-        region_order += [name for name in LANE_REGION_ORDER if name in self.regions]
-        region_order += [name for name in self.regions.keys() if name not in set(region_order)]
+        # Kiểm tra các làn trước, center sau cùng.
+        # Center chỉ dùng như vùng nút giao nội bộ; khi polygon center chồng lên
+        # b1/t1/... thì làn đường phải được ưu tiên hơn center.
+        region_order = [name for name in LANE_REGION_ORDER if name in self.regions]
+        added = set(region_order)
+        region_order += [
+            name for name in self.regions.keys()
+            if name not in added and name != "center"
+        ]
+        if "center" in self.regions:
+            region_order.append("center")
 
         matches = []
         scaled_cache = self._get_scaled_cache(width, height)
@@ -215,7 +222,7 @@ class RegionTemplate:
             center_point=self._center_point(width, height),
         )
 
-    def overlay(self, frame):
+    def overlay(self, frame, label_scale=1.0):
         if not self.loaded:
             return
 
@@ -223,16 +230,18 @@ class RegionTemplate:
         polygons = []
         scaled_cache = self._get_scaled_cache(width, height)
         added = set()
-        # Vẽ các làn trước center để viền center vẫn dễ nhìn.
-        for region_name in LANE_REGION_ORDER + ("center",):
+        # Chỉ vẽ các làn. Center vẫn được load để xét logic flow nhưng
+        # không hiển thị khi bật Show region để overlay đỡ rối.
+        for region_name in LANE_REGION_ORDER:
             entry = scaled_cache.get(region_name)
             if entry:
                 polygons.append((region_name, entry["points"]))
                 added.add(region_name)
         for region_name, entry in scaled_cache.items():
-            if region_name not in added:
-                polygons.append((region_name, entry["points"]))
-        draw_region_polygons(frame, polygons)
+            if region_name == "center" or region_name in added:
+                continue
+            polygons.append((region_name, entry["points"]))
+        draw_region_polygons(frame, polygons, label_scale=label_scale)
 
 
 def _dist(a, b):
@@ -251,12 +260,22 @@ def choose_region_from_candidates(candidates, *, centroid, previous_centroid=Non
     if len(candidates) == 1:
         return candidates[0]
 
-    if "center" in candidates:
-        # Center là nút giao. Ưu tiên center hơn vùng chồng lấn làn để route
-        # export có chuyển tiếp rõ ràng lane->center và center->lane.
+    candidate_set = set(candidates)
+
+    if "center" in candidate_set:
+        # Center có độ ưu tiên thấp hơn tất cả vùng làn.
+        # Ví dụ điểm nằm trong cả b1 và center thì kết quả phải là b1.
+        non_center_candidates = [region for region in candidates if region != "center"]
+        if non_center_candidates:
+            return choose_region_from_candidates(
+                non_center_candidates,
+                centroid=centroid,
+                previous_centroid=previous_centroid,
+                current_region=current_region,
+                center_point=center_point,
+            )
         return "center"
 
-    candidate_set = set(candidates)
     if current_region in candidate_set:
         keep_current = current_region
     else:
@@ -296,6 +315,24 @@ def centroid_from_box(box):
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
+def bottom_center_from_box(box):
+    """Điểm giữa cạnh dưới bbox, phù hợp hơn để gán xe vào polygon mặt đường."""
+    x1, y1, x2, y2 = box
+    return int((x1 + x2) / 2), int(y2)
+
+
+def region_point_from_box(box, use_bottom_center=True):
+    """Trả về điểm dùng cho nhận diện region.
+
+    Với video giao thông góc nhìn chéo, tâm bbox thường nằm trên thân xe và có
+    thể lệch sang polygon lân cận. Điểm đáy bbox gần vị trí tiếp xúc mặt đường
+    hơn nên ổn định hơn cho đếm vùng/flow.
+    """
+    if use_bottom_center:
+        return bottom_center_from_box(box)
+    return centroid_from_box(box)
+
+
 def get_direction_region(centroid, width, height, margin_fraction, template=None, previous_centroid=None, current_region=None):
     """Trả về vùng thô từ template polygon hoặc vùng 8 làn mặc định."""
     if template and template.loaded:
@@ -306,7 +343,10 @@ def get_direction_region(centroid, width, height, margin_fraction, template=None
             previous_centroid=previous_centroid,
             current_region=current_region,
         )
-        return region if region is not None else "center"
+        # Không tự gán center khi điểm không nằm trong polygon nào.
+        # Nếu template có vùng center, template.get_region() sẽ trả về center
+        # chỉ khi điểm thật sự nằm trong polygon center.
+        return region
 
     x, y = centroid
     left_margin = int(width * margin_fraction)
@@ -345,16 +385,22 @@ def _safe_label_center(contour, frame_width, frame_height):
     return cx, cy
 
 
-def _draw_readable_label(frame, text, center, color):
-    """Vẽ label dạng pill dễ đọc nhưng không quá chói."""
+def _draw_readable_label(frame, text, center, color, label_scale=1.0):
+    """Vẽ label dạng pill dễ đọc nhưng không quá chói.
+
+    label_scale dùng để giảm kích thước chữ khi chạy realtime ở phân giải thấp,
+    tránh che mất xe/box nhưng vẫn giữ tên vùng đủ đọc.
+    """
     x, y = center
     font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.50 if len(text) > 6 else 0.56
-    thickness = 2
+    label_scale = max(0.45, min(1.15, float(label_scale or 1.0)))
+    base_scale = 0.50 if len(text) > 6 else 0.56
+    scale = base_scale * label_scale
+    thickness = 1 if label_scale < 0.85 else 2
     text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
     tw, th = text_size
-    pad_x = 8
-    pad_y = 5
+    pad_x = max(4, int(8 * label_scale))
+    pad_y = max(3, int(5 * label_scale))
 
     x1 = int(x - tw / 2 - pad_x)
     y1 = int(y - th / 2 - pad_y)
@@ -379,7 +425,7 @@ def _draw_readable_label(frame, text, center, color):
 
 
 
-def draw_region_polygons(frame, polygons, alpha=0.065):
+def draw_region_polygons(frame, polygons, alpha=0.065, label_scale=1.0):
     """Vẽ nền vùng nhẹ, viền tương phản và label gọn.
 
     Không vẽ mũi tên hướng ở đây. Với 8 vùng làn, mũi tên làm overlay rối;
@@ -414,16 +460,16 @@ def draw_region_polygons(frame, polygons, alpha=0.065):
     # Vẽ label gọn sau cùng để tên vùng vẫn đọc được trên frame sáng.
     for region_name, contour, color, center in prepared:
         label = REGION_LABELS.get(region_name, REGION_SHORT_LABELS.get(region_name, region_name.upper()))
-        _draw_readable_label(frame, label, center, color)
+        _draw_readable_label(frame, label, center, color, label_scale=label_scale)
 
 
-def draw_region_overlay(frame, margin_fraction, template=None):
+def draw_region_overlay(frame, margin_fraction, template=None, label_scale=1.0):
     """
     Chỉ vẽ overlay vùng khi được gọi rõ ràng.
     Nếu không có template, vẽ vùng biên 8 làn mặc định.
     """
     if template and template.loaded:
-        template.overlay(frame)
+        template.overlay(frame, label_scale=label_scale)
         return
 
     height, width = frame.shape[:2]
@@ -443,6 +489,5 @@ def draw_region_overlay(frame, margin_fraction, template=None):
         ("r2", [(right_margin, mid_y), (width - 1, mid_y), (width - 1, height - 1), (right_margin, bottom_margin)]),
         ("b1", [(mid_x, bottom_margin), (right_margin, bottom_margin), (width - 1, height - 1), (mid_x, height - 1)]),
         ("b2", [(0, height - 1), (mid_x, height - 1), (mid_x, bottom_margin), (left_margin, bottom_margin)]),
-        ("center", [(left_margin, top_margin), (right_margin, top_margin), (right_margin, bottom_margin), (left_margin, bottom_margin)]),
     ]
-    draw_region_polygons(frame, polygons)
+    draw_region_polygons(frame, polygons, label_scale=label_scale)

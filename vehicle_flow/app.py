@@ -9,7 +9,10 @@ from PIL import ImageTk
 
 from .config import (
     BRANCH_ORDER,
+    CLASS_COLORS,
+    CLASS_DISPLAY_NAMES,
     CLASS_NAMES,
+    COLOR_LEGEND_CLASS_IDS,
     DEFAULT_AVAILABLE_MODELS,
     DEFAULT_EXPORT_ROOT,
     DEFAULT_FLUID_BIN_SECONDS,
@@ -87,6 +90,9 @@ class FlowApp:
 
         self.latest_pil_image = None
         self.latest_photo = None
+        # Kích thước thật của vùng video trên Tkinter. Worker chỉ đọc giá trị này,
+        # không gọi trực tiếp Tkinter từ thread nền để tránh lỗi thread-safety.
+        self.video_display_size = (880, 620)
         self.processing_thread = None
         self.stop_event = threading.Event()
         self.state_lock = threading.Lock()
@@ -97,7 +103,29 @@ class FlowApp:
 
         self._build_ui()
         self.load_region_template()
+        self.root.after(0, self._maximize_window)
         self.root.after(50, self._update_ui)
+
+    def _maximize_window(self):
+        """Mở ứng dụng ở trạng thái maximize, không phải fullscreen."""
+        try:
+            # Windows: dùng trạng thái zoomed chuẩn của Tk.
+            self.root.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+
+        try:
+            # Linux/X11: một số window manager hỗ trợ thuộc tính -zoomed.
+            self.root.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+
+        # Fallback cho môi trường không hỗ trợ maximize: dùng kích thước màn hình.
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        self.root.geometry(f"{screen_width}x{screen_height}+0+0")
 
     def _setup_style(self):
         self.root.option_add("*Font", ("Segoe UI", 10))
@@ -198,13 +226,63 @@ class FlowApp:
         short_names = {
             "bicycle": "Xe đạp",
             "bus": "Xe buýt",
+            "bus_truck": "Xe buýt",
+            "truck": "Xe buýt",
             "car": "Ô tô",
             "motorbike": "Xe máy",
             "motorcycle": "Xe máy",
         }
         
-        direction_names = {"In": "Vao", "Out": "Ra", "in": "Vao", "out": "Ra"}
+        direction_names = {"In": "Vào", "Out": "Ra", "in": "Vào", "out": "Ra"}
         return f"{short_names.get(class_name, class_name.title())} {direction_names.get(direction, direction)}"
+
+    def _bgr_to_hex(self, color):
+        """Đổi màu BGR OpenCV sang RGB hex cho Tkinter legend."""
+        try:
+            b, g, r = [max(0, min(255, int(v))) for v in color]
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return "#94a3b8"
+
+    def _vehicle_display_name(self, cls_id):
+        return CLASS_DISPLAY_NAMES.get(cls_id, self._vehicle_header_name(CLASS_NAMES.get(cls_id, str(cls_id)), "").strip())
+
+    def _build_color_legend(self, parent):
+        """Chú thích màu gọn một dòng để không che bảng thống kê bên dưới."""
+        legend_frame = ttk.Frame(parent, style="Card.TFrame")
+        legend_frame.pack(fill="x", pady=(0, 4))
+        legend_frame.grid_columnconfigure(len(COLOR_LEGEND_CLASS_IDS) * 2 + 1, weight=1)
+
+        ttk.Label(legend_frame, text="Màu:", style="MetricCompactName.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 6)
+        )
+
+        col = 1
+        for cls_id in COLOR_LEGEND_CLASS_IDS:
+            color = self._bgr_to_hex(CLASS_COLORS.get(cls_id, (160, 160, 160)))
+            swatch = tk.Frame(
+                legend_frame,
+                width=12,
+                height=10,
+                bg=color,
+                highlightthickness=1,
+                highlightbackground=UI["border"],
+            )
+            swatch.grid(row=0, column=col, sticky="w", padx=(0, 3))
+            swatch.grid_propagate(False)
+            ttk.Label(
+                legend_frame,
+                text=self._vehicle_display_name(cls_id),
+                style="MetricCompactName.TLabel",
+            ).grid(row=0, column=col + 1, sticky="w", padx=(0, 8))
+            col += 2
+
+    def _on_video_label_configure(self, event):
+        """Lưu kích thước vùng hiển thị để worker resize video đúng tỉ lệ."""
+        width = max(1, int(getattr(event, "width", 1)))
+        height = max(1, int(getattr(event, "height", 1)))
+        with self.state_lock:
+            self.video_display_size = (width, height)
 
     def _build_ui(self):
         shell = ttk.Frame(self.root, style="App.TFrame", padding=10)
@@ -262,6 +340,7 @@ class FlowApp:
             highlightbackground=UI["border"],
         )
         self.video_label.grid(row=1, column=0, sticky="nsew")
+        self.video_label.bind("<Configure>", self._on_video_label_configure)
 
         # ---------- Điều khiển ----------
         control_frame = ttk.LabelFrame(right_frame, text="  Điều khiển  ", padding=8)
@@ -331,6 +410,8 @@ class FlowApp:
         ]
         for idx, (title, var_name) in enumerate(metric_items):
             self._compact_metric(metrics_frame, idx // 2, idx % 2, title, var_name)
+
+        self._build_color_legend(right_frame)
 
         # ---------- Bảng đếm ----------
         # Chỉ hiển thị một bảng dài 8 làn tại một thời điểm để panel bên phải
