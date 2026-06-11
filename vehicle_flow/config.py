@@ -194,9 +194,9 @@ MODEL_IOU = 0.60
 # Tăng ngưỡng car/truck nếu xe máy thường bị đoán nhầm thành xe lớn.
 # Giảm ngưỡng motorbike nếu xe nhỏ bị bỏ sót nhiều.
 CLASS_CONF_THRESHOLDS = {
-    0: 0.75,  # bus
-    1: 0.86,  # car
-    2: 0.6,  # motorbike
+    0: 0.72,  # bus
+    1: 0.82,  # car
+    2: 0.62,  # motorbike
     3: 0.2,  # pedestrian, chỉ detect/hiển thị
     4: 0.8,  # truck
 }
@@ -364,7 +364,7 @@ PERFORMANCE_PROFILES = {
         "filter_min_box_wh_scale_by_class": {2: 1.},
         "filter_min_box_area_scale_by_class": {2: 1.55},
         # Chỉ siết mạnh motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
-        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_far_min_area_scale_by_class": {2: 0.5},
         "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
         "display_width": 960,
         "display_height": 680,
@@ -424,7 +424,7 @@ PERFORMANCE_PROFILES = {
         "filter_min_box_wh_scale_by_class": {2: 1.15},
         "filter_min_box_area_scale_by_class": {2: 1.25},
         # Chỉ siết motorbike ở vùng gần camera; vùng xa giữ scale 1.0.
-        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_far_min_area_scale_by_class": {2: 0.5},
         "perspective_near_min_area_scale_by_class": {2: 5.00, 3: 5.00},
         "display_width": 900,
         "display_height": 640,
@@ -483,7 +483,7 @@ PERFORMANCE_PROFILES = {
         "filter_min_box_area_scale": 1.00,
         "perspective_min_area_scale": 1.00,
         # Realtime chỉ tăng rất nhẹ filter motorbike ở gần để tránh nhiễu đáy ảnh.
-        "perspective_far_min_area_scale_by_class": {2: 1.00},
+        "perspective_far_min_area_scale_by_class": {2: 0.5},
         "perspective_near_min_area_scale_by_class": {2: 1.25},
         "tracker_embedder": "mobilenet",
         "display_width": 900,

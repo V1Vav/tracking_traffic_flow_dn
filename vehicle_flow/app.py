@@ -222,7 +222,7 @@ class FlowApp:
         label = ttk.Label(parent, text=text, textvariable=variable, style=style, anchor=anchor)
         return label
 
-    def _vehicle_header_name(self, class_name, direction):
+    def _vehicle_header_name(self, class_name, direction=None):
         short_names = {
             "bicycle": "Xe đạp",
             "bus": "Xe buýt",
@@ -232,9 +232,13 @@ class FlowApp:
             "motorbike": "Xe máy",
             "motorcycle": "Xe máy",
         }
-        
+
+        base_name = short_names.get(class_name, class_name.title())
+        if direction is None or str(direction).strip() == "":
+            return base_name
+
         direction_names = {"In": "Vào", "Out": "Ra", "in": "Vào", "out": "Ra"}
-        return f"{short_names.get(class_name, class_name.title())} {direction_names.get(direction, direction)}"
+        return f"{base_name} {direction_names.get(direction, direction)}"
 
     def _bgr_to_hex(self, color):
         """Đổi màu BGR OpenCV sang RGB hex cho Tkinter legend."""
@@ -434,11 +438,13 @@ class FlowApp:
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_pce"], style="TableValue.TLabel").grid(row=row, column=1, sticky="ew", padx=1, pady=1)
             self._table_label(branch_frame, variable=self.metrics[f"{branch}_count"], style="TableValue.TLabel").grid(row=row, column=2, sticky="ew", padx=1, pady=1)
 
+        # Bảng tổng theo loại xe chỉ hiển thị tổng lượt phương tiện đi vào từng vùng.
+        # Không tách thêm cột Vào/Ra vì hướng di chuyển đã được mã hóa ngay trong
+        # tên vùng: t1/l1/r1/b1 là làn vào, t2/l2/r2/b2 là làn ra.
         vehicle_headers = ["Vùng"]
         for cls_id in DISPLAY_CLASS_IDS:
             class_name = CLASS_NAMES[cls_id]
-            vehicle_headers.append(self._vehicle_header_name(class_name, "In"))
-            vehicle_headers.append(self._vehicle_header_name(class_name, "Out"))
+            vehicle_headers.append(self._vehicle_header_name(class_name))
 
         for col, header_text in enumerate(vehicle_headers):
             vehicle_frame.grid_columnconfigure(col, weight=1)
@@ -450,8 +456,7 @@ class FlowApp:
             for cls_id in DISPLAY_CLASS_IDS:
                 class_name = CLASS_NAMES[cls_id]
                 self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_in"], style="TableValue.TLabel").grid(row=row, column=col, sticky="ew", padx=1, pady=1)
-                self._table_label(vehicle_frame, variable=self.metrics[f"{branch}_{class_name}_out"], style="TableValue.TLabel").grid(row=row, column=col + 1, sticky="ew", padx=1, pady=1)
-                col += 2
+                col += 1
 
         status_frame = ttk.Frame(right_frame, style="Subtle.TFrame", padding=(8, 5))
         status_frame.pack(fill="x")
