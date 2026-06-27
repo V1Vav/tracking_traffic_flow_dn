@@ -45,27 +45,27 @@ DIRECTIONS = ("in", "out")
 DISPLAY_CLASS_IDS = (2, 3)  # car, motorbike
 
 REGION_DISPLAY_NAMES = {
-    "t1": "T1 Vao",
-    "t2": "T2 Ra",
-    "l1": "L1 Vao",
-    "l2": "L2 Ra",
-    "r1": "R1 Vao",
-    "r2": "R2 Ra",
-    "b1": "B1 Vao",
-    "b2": "B2 Ra",
-    "center": "Center",
+    "t1": "Bắc vào",
+    "t2": "Bắc ra",
+    "l1": "Tây vào",
+    "l2": "Tây ra",
+    "r1": "Đông vào",
+    "r2": "Đông ra",
+    "b1": "Nam vào",
+    "b2": "Nam ra",
+    "center": "Trung tâm",
 }
 
 REGION_SHORT_LABELS = {
-    "t1": "T1",
-    "t2": "T2",
-    "l1": "L1",
-    "l2": "L2",
-    "r1": "R1",
-    "r2": "R2",
-    "b1": "B1",
-    "b2": "B2",
-    "center": "CENTER",
+    "t1": "Bắc vào",
+    "t2": "Bắc ra",
+    "l1": "Tây vào",
+    "l2": "Tây ra",
+    "r1": "Đông vào",
+    "r2": "Đông ra",
+    "b1": "Nam vào",
+    "b2": "Nam ra",
+    "center": "Tâm",
 }
 
 REGION_TO_APPROACH = {

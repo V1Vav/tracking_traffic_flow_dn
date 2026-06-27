@@ -17,7 +17,7 @@ from vehicle_flow.config import (
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Phân tích lưu lượng phương tiện bằng YOLO + DeepSORT.",
+        description="Phân tích lưu lượng phương tiện bằng YOLO + ByteTrack.",
     )
     parser.add_argument("--headless", action="store_true", help="Chạy không mở UI, dùng cho video dài và export flow.")
     parser.add_argument("--video", help="Đường dẫn video/camera/RTSP dùng khi --headless.")

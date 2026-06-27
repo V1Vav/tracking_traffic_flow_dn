@@ -38,16 +38,18 @@ REGION_COLORS = {
     "outside": (120, 128, 140),
 }
 REGION_LABELS = {
-    "t1": "T1 VAO",
-    "t2": "T2 RA",
-    "l1": "L1 VAO",
-    "l2": "L2 RA",
-    "r1": "R1 VAO",
-    "r2": "R2 RA",
-    "b1": "B1 VAO",
-    "b2": "B2 RA",
+    # OpenCV Hershey font không render tốt dấu tiếng Việt, nên overlay dùng
+    # ASCII-safe. UI Tkinter vẫn dùng tiếng Việt có dấu trong config.py.
+    "t1": "BAC VAO",
+    "t2": "BAC RA",
+    "l1": "TAY VAO",
+    "l2": "TAY RA",
+    "r1": "DONG VAO",
+    "r2": "DONG RA",
+    "b1": "NAM VAO",
+    "b2": "NAM RA",
     "center": "CENTER",
-    "outside": "NGOÀI",
+    "outside": "NGOAI",
 }
 
 _APPROACH_LANES = {
@@ -429,7 +431,7 @@ def draw_region_polygons(frame, polygons, alpha=0.065, label_scale=1.0):
     """Vẽ nền vùng nhẹ, viền tương phản và label gọn.
 
     Không vẽ mũi tên hướng ở đây. Với 8 vùng làn, mũi tên làm overlay rối;
-    danh tính làn được thể hiện bằng màu riêng và label như T1 VÀO / T2 RA.
+    danh tính làn được thể hiện bằng màu riêng và label như BAC VAO / DONG RA.
     """
     if not polygons:
         return

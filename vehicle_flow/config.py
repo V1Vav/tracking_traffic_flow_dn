@@ -59,41 +59,45 @@ IGNORED_CLASS_IDS = tuple(sorted(set(DETECT_CLASS_IDS) - set(COUNTED_CLASS_IDS))
 REALTIME_DETECT_CLASS_IDS = DETECT_CLASS_IDS
 EXPECTED_MODEL_NAMES = CLASS_NAMES.copy()
 
-# Bố cục vùng/làn. Mỗi nhánh đường được chia thành hai vùng làn:
-#   t/l/r/b + 1 = làn Vao, đi về phía center
-#   t/l/r/b + 2 = làn ra, đi từ center ra ngoài
-# Polygon của làn 1 và làn 2 có thể chồng nhẹ để bao phủ trường hợp lấn/chuyển làn.
+# Bố cục vùng/làn nội bộ. Giữ key t/l/r/b để không làm hỏng logic
+# tracking/export đã có, nhưng UI hiển thị bằng hướng tiếng Việt:
+#   t = Bắc, b = Nam, l = Tây, r = Đông
+#   1 = làn vào, 2 = làn ra
+# Center chỉ dùng nội bộ cho logic chuyển vùng, không hiển thị trong UI chính.
 INBOUND_LANE_REGIONS = ("t1", "l1", "r1", "b1")
 OUTBOUND_LANE_REGIONS = ("t2", "l2", "r2", "b2")
 LANE_REGION_ORDER = ("t1", "t2", "l1", "l2", "r1", "r2", "b1", "b2")
 BRANCH_ORDER = LANE_REGION_ORDER + ("center",)
+DISPLAY_BRANCH_ORDER = LANE_REGION_ORDER
 VALID_BRANCHES = set(BRANCH_ORDER)
 DIRECTIONS = ("in", "out")
 DISPLAY_CLASS_IDS = (0, 1, 2)  # Xe buýt, Ô tô, Xe máy
 COLOR_LEGEND_CLASS_IDS = (0, 1, 2, 3)  # thêm Người đi bộ vào chú thích màu, không đưa vào bảng đếm
 
 REGION_DISPLAY_NAMES = {
-    "t1": "T1 Vao",
-    "t2": "T2 Ra",
-    "l1": "L1 Vao",
-    "l2": "L2 Ra",
-    "r1": "R1 Vao",
-    "r2": "R2 Ra",
-    "b1": "B1 Vao",
-    "b2": "B2 Ra",
-    "center": "Center",
+    "t1": "Bắc vào",
+    "t2": "Bắc ra",
+    "l1": "Tây vào",
+    "l2": "Tây ra",
+    "r1": "Đông vào",
+    "r2": "Đông ra",
+    "b1": "Nam vào",
+    "b2": "Nam ra",
+    "center": "Trung tâm",
 }
 
+# Label ngắn cho Tkinter có thể dùng Unicode. Riêng overlay OpenCV dùng
+# REGION_LABELS trong regions.py ở dạng ASCII để tránh lỗi font tiếng Việt.
 REGION_SHORT_LABELS = {
-    "t1": "T1",
-    "t2": "T2",
-    "l1": "L1",
-    "l2": "L2",
-    "r1": "R1",
-    "r2": "R2",
-    "b1": "B1",
-    "b2": "B2",
-    "center": "CENTER",
+    "t1": "Bắc vào",
+    "t2": "Bắc ra",
+    "l1": "Tây vào",
+    "l2": "Tây ra",
+    "r1": "Đông vào",
+    "r2": "Đông ra",
+    "b1": "Nam vào",
+    "b2": "Nam ra",
+    "center": "Tâm",
 }
 
 REGION_TO_APPROACH = {
@@ -128,6 +132,17 @@ REGION_NAME_MAP = {
     "bottom1": "b1", "bottom_in": "b1", "in_bottom": "b1", "bottom_inbound": "b1",
     "bottom2": "b2", "bottom_out": "b2", "out_bottom": "b2", "bottom_outbound": "b2",
 
+    # Alias hướng tiếng Việt/ASCII cho template mới. Nên dùng dạng ASCII
+    # bac_vao, dong_ra... nếu muốn tránh lỗi mã hóa khi chỉnh CSV bằng Excel.
+    "bac_vao": "t1", "bac vao": "t1", "bắc_vào": "t1", "bắc vào": "t1",
+    "bac_ra": "t2", "bac ra": "t2", "bắc_ra": "t2", "bắc ra": "t2",
+    "tay_vao": "l1", "tay vao": "l1", "tây_vào": "l1", "tây vào": "l1",
+    "tay_ra": "l2", "tay ra": "l2", "tây_ra": "l2", "tây ra": "l2",
+    "dong_vao": "r1", "dong vao": "r1", "đông_vào": "r1", "đông vào": "r1",
+    "dong_ra": "r2", "dong ra": "r2", "đông_ra": "r2", "đông ra": "r2",
+    "nam_vao": "b1", "nam vao": "b1", "nam_vào": "b1", "nam vào": "b1",
+    "nam_ra": "b2", "nam ra": "b2",
+
     # Template 8 làn hiện tại chỉ nên dùng t1/t2/l1/l2/r1/r2/b1/b2/center
     # hoặc các alias làn rõ ràng ở trên. Các tên vùng cũ kiểu
     # top/left/right/bottom được cố ý không chấp nhận nữa, vì
@@ -136,20 +151,10 @@ REGION_NAME_MAP = {
     "none": None,
 }
 
-# Đường dẫn template mặc định hiển thị trên UI. Template 4 vùng cũ vẫn sẽ
-# bị RegionTemplate từ chối, nên giữ mặc định này vẫn an toàn cho app 8 làn.
+# Đường dẫn mặc định cho GUI/headless. GUI không còn cho chọn model/template
+# trực tiếp để tránh cấu hình sai; headless vẫn có thể override bằng tham số CLI.
 DEFAULT_TEMPLATE_MAPPING = "template.csv"
 DEFAULT_MODEL_PATH = "models/best.pt"
-DEFAULT_AVAILABLE_MODELS = [
-    "models/tuning_200.pt",
-    "models/tuning_50.pt",
-    "models/best.pt",
-    # "models/yolov8n.pt",
-    # "models/yolov8s.pt",
-    # "models/yolov8m.pt",
-    # "models/yolov8l.pt",
-    # "models/yolov8x.pt",
-]
 
 # Tham số ổn định khi đếm theo vùng.
 # Tăng STABLE_REGION_FRAMES nếu xe bị nhiễu quanh mép polygon.
@@ -194,11 +199,11 @@ MODEL_IOU = 0.60
 # Tăng ngưỡng car/truck nếu xe máy thường bị đoán nhầm thành xe lớn.
 # Giảm ngưỡng motorbike nếu xe nhỏ bị bỏ sót nhiều.
 CLASS_CONF_THRESHOLDS = {
-    0: 0.72,  # bus
+    0: 0.75,  # bus
     1: 0.82,  # car
-    2: 0.62,  # motorbike
+    2: 0.63,  # motorbike
     3: 0.2,  # pedestrian, chỉ detect/hiển thị
-    4: 0.8,  # truck
+    4: 0.82,  # truck
 }
 
 # Bộ lọc hình học cơ bản để loại box nhiễu/không hợp lý.
@@ -372,8 +377,8 @@ PERFORMANCE_PROFILES = {
         "drop_frames_when_slow": False,
         "realtime_queue_size": 3,
         "bbox_thickness": 3,
-        "bbox_center_radius": 3,
-        "draw_track_labels": True,
+        "bbox_center_radius": 0,
+        "draw_track_labels": False,
         "draw_track_class_name": False,
         "track_label_font_scale": 0.45,
         "track_label_thickness": 1,
@@ -432,8 +437,8 @@ PERFORMANCE_PROFILES = {
         "drop_frames_when_slow": True,
         "realtime_queue_size": 2,
         "bbox_thickness": 2,
-        "bbox_center_radius": 3,
-        "draw_track_labels": True,
+        "bbox_center_radius": 0,
+        "draw_track_labels": False,
         "draw_track_class_name": False,
         "track_label_font_scale": 0.38,
         "track_label_thickness": 1,
@@ -498,8 +503,8 @@ PERFORMANCE_PROFILES = {
         "realtime_queue_size": 1,
         "cpu_thread_count": 6,
         "bbox_thickness": 2,
-        "bbox_center_radius": 2,
-        "draw_track_labels": True,
+        "bbox_center_radius": 0,
+        "draw_track_labels": False,
         "draw_track_class_name": False,
         "track_label_font_scale": 0.32,
         "track_label_thickness": 1,

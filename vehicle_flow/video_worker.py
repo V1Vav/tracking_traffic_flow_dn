@@ -1605,7 +1605,7 @@ def process_video(app, video_path, model_path):
                 cap.release()
 
         with app.state_lock:
-            app.worker_state["status"] = "Đang mở nguồn live..." if realtime_source else "Đang đệm video..."
+            app.worker_state["status"] = "Đang chuẩn bị nguồn video..."
 
         reader_thread = threading.Thread(target=video_reader, daemon=True)
         reader_thread.start()
@@ -1619,19 +1619,7 @@ def process_video(app, video_path, model_path):
                 time.sleep(0.05)
 
         with app.state_lock:
-            source_mode = "live" if realtime_source else "file"
-            fps_note = "valid" if fps_metadata_valid else "fallback"
-            downsample_note = f", process_fps={target_process_fps:.1f}"
-            if fps_downsample_enabled:
-                downsample_note += " (downsampled)"
-            app.worker_state["status"] = (
-                f"{source_mode.title()} source ready @ source_fps={fps_input:.1f} ({fps_note})"
-                f"{downsample_note} | "
-                f"perf={performance_profile}, device={device}, cpu_threads={cpu_threads}, "
-                f"async_display={async_display}, skip_stale={drop_frames_when_slow}, q={buffer_size}, "
-                f"display/{display_every_n}, imgsz={model_imgsz}, width={process_width or 'native'}, "
-                f"yolo_classes={list(detect_class_ids) if detect_class_ids else 'all'}"
-            )
+            app.worker_state["status"] = "Đang phân tích..."
 
         if app.region_template and app.region_template.loaded:
             # Center luôn là một dòng hợp lệ trong UI. Vùng làn chỉ hợp lệ
@@ -1673,7 +1661,7 @@ def process_video(app, video_path, model_path):
             except Exception:
                 pass
             with app.state_lock:
-                app.worker_state["status"] = f"Đang xuất flow vào {exporter.output_dir}"
+                app.worker_state["status"] = "Đang lưu kết quả..."
 
         track_meta = {}
         prev_time = time.time()
@@ -2228,17 +2216,7 @@ def process_video(app, video_path, model_path):
                     total_in_count += branch_count_total[(branch, "in")]
 
             display_fps = fps_ema if fps_ema is not None else fps
-            realtime_ratio = display_fps / target_process_fps if target_process_fps > 0 else 0.0
-            source_label = "trực tiếp" if realtime_source else "file"
-            downsample_label = f", src_fps={fps_input:.1f}->proc_fps={target_process_fps:.1f}"
-            display_label = "headless" if headless_mode else f"hiển_thị/{display_every_n}"
-            status_text = (
-                f"Đang chạy ({source_label}, {performance_profile}/{profile_resolution_name or (str(process_width) + 'px')}, {device}, "
-                f"{realtime_ratio:.2f}x tốc_độ_xử_lý{downsample_label}, detect/{detect_interval}, "
-                f"{display_label}, max_det={max_det}, "
-                f"bỏ_frame={'bật' if drop_frames_when_slow else 'tắt'}, "
-                f"lock_fps={'bật' if strict_fps_lock else 'tắt'}, q={buffer_size}, cpu={cpu_threads})"
-            )
+            status_text = "Đang phân tích..."
 
             with app.state_lock:
                 if pil_image is not None:
@@ -2336,10 +2314,12 @@ def process_video(app, video_path, model_path):
             )
 
         with app.state_lock:
-            if exporter is not None:
-                app.worker_state["status"] = ("Đã dừng" if app.stop_event.is_set() else "Hoàn tất") + f" | export: {exporter.output_dir}"
+            if app.stop_event.is_set():
+                app.worker_state["status"] = "Đã dừng"
+            elif exporter is not None:
+                app.worker_state["status"] = "Hoàn tất. Kết quả đã được lưu."
             else:
-                app.worker_state["status"] = "Đã dừng" if app.stop_event.is_set() else "Hoàn tất"
+                app.worker_state["status"] = "Hoàn tất"
 
     except Exception as exc:
         with app.state_lock:
